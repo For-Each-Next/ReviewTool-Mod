@@ -7,6 +7,11 @@ import { textRects } from './range-rects';
 import { highlightBackgrounds } from './highlight-backgrounds';
 
 const colors: readonly HighlightColor[] = ['red', 'yellow', 'green', 'blue'];
+const reviewColors: readonly HighlightColor[] = ['yellow', 'green', 'blue', 'red'];
+function nextReviewColor(annotations: readonly HighlightAnnotation[]): HighlightColor {
+  const previous = annotations.length ? reviewColors.indexOf(annotations[annotations.length - 1].color) : -1;
+  return reviewColors[(previous + 1) % reviewColors.length];
+}
 interface Marker { annotation: HighlightAnnotation; range: Range; rects?: DOMRect[] }
 type Active = { kind: 'selection'; selection: MappedSelection } | { kind: 'marker'; id: string };
 
@@ -41,7 +46,11 @@ export function createHighlighting(doc: Document, view: RenderedView, config: Hi
     const line = doc.createElementNS(svg.namespaceURI, 'path'); line.setAttribute('d', path); svg.append(line);
     return svg;
   };
-  const buttons = colors.map(color => {
+  const buttons = config.localEditing ? [(() => {
+    const button = doc.createElement('button'); button.type = 'button'; button.dataset.addHighlight = '';
+    button.setAttribute('aria-label', messages.addComment); button.title = messages.addComment;
+    button.append(icon('M12 5v14M5 12h14')); bar.append(button); return button;
+  })()] : colors.map(color => {
     const button = doc.createElement('button'); button.type = 'button'; button.dataset.color = color;
     const label = messages[color];
     button.setAttribute('aria-label', label); button.title = label;
@@ -52,7 +61,7 @@ export function createHighlighting(doc: Document, view: RenderedView, config: Hi
   const remove = doc.createElement('button'); remove.type = 'button'; remove.dataset.deleteHighlight = '';
   remove.setAttribute('aria-label', messages.deleteHighlight); remove.title = messages.deleteHighlight;
   remove.append(icon('M4 7h16M9 7V4h6v3M6 7l1 14h10l1-14M10 11v6m4-6v6'));
-  bar.append(separator, remove);
+  if (!config.localEditing) bar.append(separator, remove);
 
   const cancel = () => { if (timer !== undefined) clearTimeout(timer); timer = undefined; };
   const cancelFrame = () => { win.cancelAnimationFrame(frame); frame = 0; };
@@ -81,6 +90,11 @@ export function createHighlighting(doc: Document, view: RenderedView, config: Hi
   };
   const show = (next: Active, anchor: DOMRect) => {
     cancel(); cancelFrame(); active = next;
+    if (config.localEditing && next.kind === 'marker') {
+      bar.hidden = true; popupLayout.hide('highlight');
+      for (const listener of hoverListeners) listener(next.id, anchor);
+      return;
+    }
     if (!bar.isConnected) root.append(bar);
     bar.hidden = false;
     const editing = next.kind === 'marker';
@@ -133,7 +147,7 @@ export function createHighlighting(doc: Document, view: RenderedView, config: Hi
   const activateButton = async (event: MouseEvent) => {
     const button = (event.target as Element).closest<HTMLButtonElement>('button');
     if (!button || !active || reasonPending) return;
-    const color = button.dataset.color as HighlightColor | undefined;
+    const color = config.localEditing ? (button === buttons[0] ? nextReviewColor(state.annotations) : undefined) : button.dataset.color as HighlightColor | undefined;
     const current = active;
     if (current.kind === 'marker' && button === remove) {
       const annotation = state.annotations.find(annotation => annotation.id === current.id);

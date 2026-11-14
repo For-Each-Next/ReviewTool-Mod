@@ -3,14 +3,37 @@ import { commentLayout } from './comment-layout';
 import type { AnnotationComment, CommentDraft, HighlightAnnotation, ModerationReasonPrompt, RenderedView, RenderOptions } from './types';
 import type { PopupLayout } from './popup-layout';
 import { textRects } from './range-rects';
-import { canEditComment, canResolveThread, findAnnotationComment, findComment, needsModerationReason, requestActionReason, type ModerationTarget } from './permissions';
+import { canEditComment, canRemoveAnnotation, canResolveThread, findAnnotationComment, findComment, needsModerationReason, requestActionReason, type ModerationTarget } from './permissions';
 
 import { threadRoots, annotationVisible } from './annotation-state';
-import { renderCommentMarkup } from './comment-markup';
+import { renderCommentMarkup, reviewCommentInMarkup } from './comment-markup';
 import { confirmThreadClose } from './confirm-close';
 import { annotationCommentUrl } from './view-url';
 
 type Draft = { text: string; kind: 'new' } | { text: string; kind: 'reply' | 'edit'; commentId: string; reason?: string };
+
+/** Continue wikitext bullets while leaving multiline templates and literal markup intact. */
+function attachListEditing(input: HTMLTextAreaElement, signal: AbortSignal) {
+  input.addEventListener('keydown', event => {
+    if (event.key !== 'Enter' || event.defaultPrevented || event.isComposing || event.keyCode === 229 || event.shiftKey || event.ctrlKey || event.altKey || event.metaKey) return;
+    const value = input.value, start = input.selectionStart, end = input.selectionEnd;
+    if (reviewCommentInMarkup(value, start)) return;
+    const lineStart = value.lastIndexOf('\n', start - 1) + 1;
+    const nextLine = value.indexOf('\n', end), lineEnd = nextLine === -1 ? value.length : nextLine;
+    const line = value.slice(lineStart, lineEnd), marker = /^([ \t]*)([#*]+)[ \t]*/.exec(line);
+    if (marker && start < lineStart + marker[0].length) return;
+    event.preventDefault();
+    if (marker && !line.slice(marker[0].length).trim() && start === end) input.setRangeText('', lineStart, lineEnd, 'end');
+    else if (marker) input.setRangeText(`\n${marker[1]}${marker[2] === '#' ? '#*' : marker[2]} `, start, end, 'end');
+    else if (reviewCommentInMarkup(value, lineStart)) input.setRangeText('\n* ', start, end, 'end');
+    else {
+      const before = value.slice(lineStart, start), indentation = /^[ \t]*/.exec(before)?.[0] ?? '';
+      input.setRangeText(`${line.trim() ? `${indentation}* ${before.slice(indentation.length)}\n` : ''}${indentation}* `, lineStart, end, 'end');
+    }
+    const EventConstructor = input.ownerDocument.defaultView?.Event;
+    if (EventConstructor) input.dispatchEvent(new EventConstructor('input', { bubbles: true }));
+  }, { signal });
+}
 
 /** A local comment thread for each source-anchored highlight. */
 export function createCommentPanel(doc: Document, view: RenderedView, column: HTMLElement, popups: PopupLayout, author: string, initialDrafts: readonly CommentDraft[] = [], groups: readonly string[] = [], promptReason?: ModerationReasonPrompt, messages: AnnotationMessages = annotationMessages(), renderOptions: RenderOptions = {}) {
@@ -21,6 +44,7 @@ export function createCommentPanel(doc: Document, view: RenderedView, column: HT
   const state = highlighting, win = window;
   const currentAuthor = author.trim();
   const actor = { name: currentAuthor, groups };
+  const localEditing = renderOptions.commentAutosave === true && renderOptions.commentCanWrite !== false;
   // Omitting timeZone uses the browser/system timezone, including daylight saving.
   const dateOptions: Intl.DateTimeFormatOptions = { year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' };
   const dateFormat = new Intl.DateTimeFormat(messages.dateLocale, dateOptions);
@@ -49,7 +73,7 @@ export function createCommentPanel(doc: Document, view: RenderedView, column: HT
   const expandedRoots = new Set<string>();
   const readDrafts = (): readonly CommentDraft[] => Object.freeze([...retainedDrafts.values(), ...[...threads.values()].flatMap(thread => thread.drafts)].map(draft => Object.freeze({ ...draft })));
   const draftsChanged = () => onDraftsChange?.(readDrafts());
-  const layout = commentLayout(doc, view, column, container, () => [...threads.values()].map(item => ({ element: item.element, anchor: item.annotation.anchor, revision: item.revision })), popups);
+  const layout = commentLayout(doc, view, column, container, () => [...threads.values()].map(item => ({ element: item.element, anchor: item.annotation.anchor, revision: item.revision })), popups, renderOptions.commentFloating);
   let timer: ReturnType<typeof setTimeout> | undefined;
   let reasonPending = false;
   const reasonFor = async (action: ModerationTarget, annotation: HighlightAnnotation) => {
@@ -144,6 +168,32 @@ export function createCommentPanel(doc: Document, view: RenderedView, column: HT
       input.placeholder = draft.kind === 'reply' ? messages.writeReply : messages.writeComment;
       input.setAttribute('aria-label', draft.kind === 'reply' ? messages.replyText : messages.commentText);
       const actions = doc.createElement('div'); actions.className = 'annotation-comment-editor-actions';
+      if (localEditing) {
+        attachListEditing(input, options.signal);
+        const clear = button(messages.clearComment, async () => {
+          const reason = await reasonFor({ type: 'delete-highlight' }, annotation);
+          if (reason === null || controller.signal.aborted || !element.isConnected) return;
+          // The host captures the previous local snapshot for its single-step undo.
+          draftsChanged();
+          state.dispatch({ type: 'delete-highlight', id: annotation.id, ...(reason ? { reason } : {}) });
+          drafts.clear();
+          for (const [storedKey, stored] of retainedDrafts) if (stored.annotationId === annotation.id) retainedDrafts.delete(storedKey);
+          draftsChanged();
+        });
+        clear.disabled = !canRemoveAnnotation(annotation, actor);
+        actions.append(clear);
+        form.append(input, actions);
+        const resize = () => {
+          const previous = input.style.height;
+          input.style.height = '0px'; input.style.height = `${Math.min(360, Math.max(21, input.scrollHeight))}px`;
+          if (input.style.height !== previous) revision++;
+          layout.schedule();
+        };
+        input.addEventListener('input', () => { draft.text = input.value; resize(); draftsChanged(); }, options);
+        form.addEventListener('submit', event => event.preventDefault(), options);
+        win.requestAnimationFrame(() => { if (input.isConnected) resize(); });
+        return form;
+      }
       const original = savedComment?.text.replace(/\r\n?/g, '\n');
       const canSubmit = () => Boolean(input.value.trim()) && (draft.kind !== 'edit' || (original !== undefined && input.value !== original));
       const send = button(draft.kind === 'edit' ? messages.saveChanges : messages.send, () => {
@@ -216,7 +266,7 @@ export function createCommentPanel(doc: Document, view: RenderedView, column: HT
         // Keyboard focus offers the same expanded reading state as hover.
         text.tabIndex = 0;
         const actions = doc.createElement('div'); actions.className = 'annotation-comment-actions';
-        actions.append(copyLink);
+        if (renderOptions.commentLinks !== false) actions.append(copyLink);
         if (resolutionToggle) actions.append(resolutionToggle);
         else if (root && renderOptions.commentCanWrite !== false) actions.append(button(messages.markResolved, () => setResolution(true)));
         if (canResolveThread(annotation, comment.id, actor)) {
@@ -250,16 +300,23 @@ export function createCommentPanel(doc: Document, view: RenderedView, column: HT
       const focused = doc.activeElement instanceof win.HTMLTextAreaElement && content.contains(doc.activeElement) ? doc.activeElement : null;
       const caret = focused ? { key: focused.dataset.draft, start: focused.selectionStart, end: focused.selectionEnd, direction: focused.selectionDirection } : null;
       element.querySelector('.annotation-highlight-attribution')?.remove(); content.replaceChildren();
-      if (annotation.author && (!threadRoots(annotation).length || threadRoots(annotation).some(root => root.author !== annotation.author))) {
+      if (!localEditing && annotation.author && (!threadRoots(annotation).length || threadRoots(annotation).some(root => root.author !== annotation.author))) {
         const attribution = doc.createElement('div'); attribution.className = 'annotation-highlight-attribution';
         attribution.textContent = messages.highlightedBy(annotation.author); attribution.title = attribution.textContent; element.prepend(attribution);
       }
-      const rootDraft = drafts.get('root');
       const roots = threadRoots(annotation).filter(root => !root.resolved);
+      if (localEditing) {
+        for (const root of roots) {
+          const editKey = 'edit/' + root.id;
+          if (canEditComment(root, actor) && !drafts.has(editKey)) drafts.set(editKey, { kind: 'edit', commentId: root.id, text: root.text });
+        }
+        if (!roots.length && !drafts.has('root')) drafts.set('root', { kind: 'new', text: '' });
+      }
+      const rootDraft = drafts.get('root');
       element.toggleAttribute('data-all-resolved', Boolean(roots.length && roots.every(root => root.resolution?.resolved) && !drafts.size));
       for (const root of threadRoots(annotation)) if (!root.resolved) content.append(message(root));
       if (rootDraft) content.append(editor('root', rootDraft));
-      else {
+      else if (!localEditing) {
         const placeholder = button(threadRoots(annotation).length ? messages.addSeparateComment : messages.addComment, () => open('root', { kind: 'new', text: '' }));
         placeholder.className = 'annotation-comment-placeholder'; content.append(placeholder);
       }
@@ -283,16 +340,32 @@ export function createCommentPanel(doc: Document, view: RenderedView, column: HT
     };
   }
 
-  const sync: Parameters<typeof state.subscribe>[0] = annotations => {
+  const sync: Parameters<typeof state.subscribe>[0] = (annotations, action) => {
     const visible = annotations.filter(annotationVisible);
     const ids = new Set(visible.map(annotation => annotation.id));
-    for (const [id, item] of threads) if (!ids.has(id)) { for (const draft of item.drafts) retainedDrafts.set(draftKey(draft), draft); layout.unobserve(item.element); item.destroy(); threads.delete(id); }
+    for (const [id, item] of threads) if (!ids.has(id)) {
+      if (!localEditing || !annotations.some(annotation => annotation.id === id && annotation.deleted)) {
+        for (const draft of item.drafts) retainedDrafts.set(draftKey(draft), draft);
+      } else {
+        for (const [storedKey, draft] of retainedDrafts) if (draft.annotationId === id) retainedDrafts.delete(storedKey);
+      }
+      layout.unobserve(item.element); item.destroy(); threads.delete(id);
+    }
     for (const annotation of visible) {
       let item = threads.get(annotation.id);
       if (!item) { item = thread(annotation); threads.set(annotation.id, item); container.append(item.element); layout.observe(item.element); }
       item.update(annotation);
     }
     layout.schedule();
+    if (renderOptions.commentFloating && action?.type === 'add-highlight') {
+      win.requestAnimationFrame(() => {
+        if (controller.signal.aborted) return;
+        const range = view.restoreRange(action.highlight.anchor), anchor = range && textRects(range, doc)[0];
+        if (!anchor) return;
+        activate(action.highlight.id, anchor);
+        win.requestAnimationFrame(() => threads.get(action.highlight.id)?.element.querySelector('textarea')?.focus({ preventScroll: true }));
+      });
+    }
   };
   sync(state.annotations);
   const stop = state.subscribe(sync);

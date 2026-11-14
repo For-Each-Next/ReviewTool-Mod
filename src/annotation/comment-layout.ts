@@ -24,7 +24,7 @@ function outlineRects(rects: readonly DOMRect[]): DOMRect[] {
 }
 
 /** Align cards to source lines, pushing later cards down only when they would overlap. */
-export function commentLayout(doc: Document, view: RenderedView, column: HTMLElement, container: HTMLElement, cards: () => readonly CommentCard[], popups: PopupLayout) {
+export function commentLayout(doc: Document, view: RenderedView, column: HTMLElement, container: HTMLElement, cards: () => readonly CommentCard[], popups: PopupLayout, floating = false) {
   const win = doc.defaultView;
   if (!win) throw new Error('Comment layout requires a browser window.');
   const controller = new AbortController();
@@ -95,7 +95,7 @@ export function commentLayout(doc: Document, view: RenderedView, column: HTMLEle
     const boxKey = `${article.left + win.scrollX}:${article.top + win.scrollY}:${article.width}:${article.height}`;
     if (boxKey !== sourceBoxKey) { sourceBoxKey = boxKey; sourceVersion++; }
     const all = cards();
-    const nextCompact = host.left < article.right - 1 || host.width < 140;
+    const nextCompact = floating || host.left < article.right - 1 || host.width < 140;
     if (nextCompact !== compact) { active = null; floatingAnchor = null; }
     compact = nextCompact;
     attribute(container, 'data-layout', compact ? 'floating' : 'margin');

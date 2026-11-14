@@ -1,0 +1,32 @@
+name: Build Tampermonkey script
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run check:annotation
+      - run: npm run check:live
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:mod
+      - run: npm run release
+      - run: npm run build:userscript
+      - run: node --check dist/reviewtool-mod.user.js
+      - uses: actions/upload-artifact@v7
+        with:
+          name: reviewtool-mod-userscript
+          path: dist/reviewtool-mod.user.js
+          if-no-files-found: error

@@ -42,7 +42,7 @@ export function mountWikipediaAnnotation(doc: Document, projection: Projection, 
   const display = original.style.getPropertyValue('display');
   const priority = original.style.getPropertyPriority('display');
   const hadStyle = original.hasAttribute('style');
-  const mobileColumn = options.comments && doc.querySelector('.skin-minerva') ? doc.createElement('div') : null;
+  const mobileColumn = options.comments && (options.commentFloating || doc.querySelector('.skin-minerva')) ? doc.createElement('div') : null;
   if (mobileColumn) { mobileColumn.className = 'annotation-mobile-comments-host'; doc.body.append(mobileColumn); }
   const column = options.comments ? mobileColumn ?? doc.querySelector<HTMLElement>('div.vector-column-end.no-font-mode-scale') : null;
   if (options.comments && !column) throw new Error('Expected the Vector right column for annotation comments.');
@@ -52,7 +52,7 @@ export function mountWikipediaAnnotation(doc: Document, projection: Projection, 
   let headings: ReturnType<typeof bindHeadingAnchors>;
   try { headings = bindHeadingAnchors(original, view.element, options.headingAnchors ?? []); }
   catch (error) { view.destroy(); mobileColumn?.remove(); throw error; }
-  const restorePinnedControls = relocatePinnedControls(doc, column);
+  const restorePinnedControls = options.commentFloating ? () => {} : relocatePinnedControls(doc, column);
   original.after(view.element);
   original.style.setProperty('display', 'none', 'important');
   mounted.add(original);

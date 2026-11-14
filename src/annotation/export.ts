@@ -4,8 +4,10 @@ import { threadRoots } from './annotation-state';
 import { headingSourceStart } from './heading-anchors';
 import { selectionFromSource } from './mapping';
 import { SourceIndex } from './source-index';
-import type { AnnotationComment, AnnotationRemoval, HighlightAnnotation, Projection, ViewNode } from './types';
+import type { AnnotationComment, AnnotationRemoval, HighlightAnnotation, Projection, ViewNode, WikipediaHeadingAnchor } from './types';
 import { encodeId } from './uuid';
+import { scanCommentMarkup } from './comment-markup';
+export { reviewCommentInMarkup } from './comment-markup';
 
 export const annotationExportFormat = 'reviewtool.annotation-export/2';
 
@@ -85,4 +87,88 @@ export function downloadAnnotationExport(doc: Document, payload: ReturnType<type
   link.download = `review-tool-annotations-${payload.document.revisionId}-${new Date(payload.exportedAt).toISOString().replace(/[:.]/g, '')}.json`;
   doc.body.append(link); link.click(); link.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+/** Article quotations and labels are literal text, even inside the rvw template. */
+function inlineWikitext(value: string): string {
+  return value.replace(/\s+/g, ' ').trim().replace(/[&<>"'\[\]{}|~_:#*;=]/g, character => `&#${character.codePointAt(0)};`);
+}
+
+function reviewSections(projection: Projection, offsets: SourceIndex, headingAnchors: readonly WikipediaHeadingAnchor[]) {
+  const anchors = new Map(headingAnchors.map(heading => [heading.start, heading.id]));
+  const headings: { level: number; start: number; title: string; anchor: string }[] = [];
+  const text = (nodes: readonly ViewNode[]): string => nodes.map(node => node.kind === 'text' ? node.text : node.kind === 'element' ? text(node.children) : '').join('');
+  const visit = (nodes: readonly ViewNode[]) => {
+    for (const node of nodes) {
+      if (node.kind !== 'element') continue;
+      const from = headingSourceStart(node);
+      if (from !== undefined) {
+        const start = offsets.toByte(from);
+        headings.push({ level: Number(node.tag.slice(1)), start, title: text(node.children).trim() || '未命名章节', anchor: anchors.get(start) ?? '' });
+      }
+      visit(node.children);
+    }
+  };
+  visit(projection.blocks);
+  headings.sort((left, right) => left.start - right.start);
+  const path: typeof headings = [];
+  const sections = [{ start: -1, title: '序言', anchor: '' }];
+  for (const heading of headings) {
+    while (path.length && path[path.length - 1].level >= heading.level) path.pop();
+    path.push(heading);
+    sections.push({ start: heading.start, title: path.map(part => part.title).join(' / '), anchor: heading.anchor });
+  }
+  return sections;
+}
+
+function commentItems(value: string): string[] {
+  const text = value.replace(/\r\n?/g, '\n'), items: string[] = [];
+  let start = 0;
+  const append = (end: number) => {
+    const item = text.slice(start, end).trim();
+    if (item) items.push(item);
+    start = end + 1;
+  };
+  scanCommentMarkup(text, append);
+  append(text.length);
+  return items;
+}
+
+function reviewCommentLines(comment: AnnotationComment, depth = 1): string[] {
+  const lines: string[] = [];
+  for (const item of commentItems(comment.text)) {
+    const marker = /^\\?([*#]+)(?:[ \t]+|$)/.exec(item);
+    const itemDepth = depth + (marker ? Math.max(0, marker[1].replace(/^#/, '').length - 1) : 0);
+    const text = marker ? item.slice(marker[0].length) : item;
+    if (text.trim()) lines.push(`#${'*'.repeat(itemDepth)} ${text}`);
+  }
+  for (const reply of comment.replies) lines.push(...reviewCommentLines(reply, depth + 1));
+  return lines;
+}
+
+/** Readable review text matching the personal userscript, without publishing an edit. */
+export function buildReviewWikitext(identity: ReviewIdentity, pageName: string, projection: Projection, annotations: readonly HighlightAnnotation[], headingAnchors: readonly WikipediaHeadingAnchor[] = []): string {
+  if (!Number.isSafeInteger(identity.revisionId) || identity.revisionId < 1) throw new TypeError('A valid article revision is required for export.');
+  const offsets = new SourceIndex(projection.source), sections = reviewSections(projection, offsets, headingAnchors);
+  const highlights = annotations.filter(annotation => !annotation.deleted).sort((left, right) => left.anchor.start - right.anchor.start || (left.id < right.id ? -1 : left.id > right.id ? 1 : 0));
+  const lines: string[] = [];
+  let sectionIndex = 0, previousSection = -1;
+  for (const annotation of highlights) {
+    while (sectionIndex + 1 < sections.length && sections[sectionIndex + 1].start <= annotation.anchor.start) sectionIndex++;
+    if (sectionIndex !== previousSection) {
+      if (lines.length) lines.push('--~~~~', '');
+      const section = sections[sectionIndex], fragment = section.anchor ? `#${section.anchor}` : '';
+      lines.push(`'''[[Special:PermaLink/${identity.revisionId}${fragment}|${inlineWikitext(section.title)}]]'''`);
+      previousSection = sectionIndex;
+    }
+    const quote = selectionFromSource(projection, annotation.anchor)?.quote ?? projection.source.slice(offsets.toUtf16(annotation.anchor.start), offsets.toUtf16(annotation.anchor.end));
+    const prefix = `# {{rvw|${inlineWikitext(quote)}}} —— `;
+    const comments = threadRoots(annotation).flatMap(comment => reviewCommentLines(comment));
+    if (comments.length === 1 && comments[0].startsWith('#* ') && !comments[0].includes('\n')) lines.push(prefix + comments[0].slice(3));
+    else lines.push(prefix, ...comments);
+  }
+  if (!lines.length) return '';
+  lines.push('--~~~~');
+  const notice = '以下内容使用[[WP:REVTOOL]]生成<!-- 预期条目变化比较大，没有启用[[Special:PrefixIndex/Wikipedia:ReviewTool/data/|联机行内凸显]]功能😂 -->。--~~~~';
+  return [`=== For Each ... Next的意见 @ ${inlineWikitext(pageName)} ===`, '', notice, '', ...lines].join('\n');
 }

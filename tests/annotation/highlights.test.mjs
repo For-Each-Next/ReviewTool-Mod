@@ -28,7 +28,7 @@ async function inPage(source, callback, renderOptions = {}, beforeRender) {
       window.markerSnapshots = [];
       window.markerView = annotation.createAnnotationView(document, annotation.createProjection(source), {
         referenceBaseUrl: location.origin + '/', commentAuthor: 'Example', ...renderOptions,
-        highlighting: { onChange: (snapshot, action) => { markerSnapshots.push(snapshot); markerActions.push(action); } },
+        highlighting: { ...renderOptions.highlighting, onChange: (snapshot, action) => { markerSnapshots.push(snapshot); markerActions.push(action); } },
       });
       document.getElementById('test-content').append(markerView.element);
       window.originalRuns = [...markerView.element.querySelectorAll('[data-source-run]')].map(element => element.firstChild);
@@ -535,4 +535,59 @@ test('Wikipedia markers and selections preserve text colors in light/dark modes 
     await page.evaluate(() => { annotationPageLab.setEnabled(false); annotationPageLab.setEnabled(true); });
     assert.deepEqual(await page.evaluate(() => annotationPageLab.view.highlighting.annotations), original);
   } finally { await page.close(); }
+});
+
+test('local selections use one add-comment action and cycle colors without rewinding after deletion', async () => {
+  await inPage('First Second Third Fourth Fifth', async page => {
+    for (const [from, to] of [[0, 5], [6, 12], [13, 18], [19, 25]]) {
+      await select(page, from, to);
+      assert.equal(await toolbar(page).getByRole('button').count(), 1);
+      assert.equal(await toolbar(page).locator('[data-add-highlight]').count(), 1);
+      await toolbar(page).getByRole('button', { name: '新增評論…', exact: true }).click();
+    }
+    assert.deepEqual(await page.evaluate(() => markerView.highlighting.annotations.map(item => item.color)), ['yellow', 'green', 'blue', 'red']);
+    await page.evaluate(() => markerView.highlighting.dispatch({ type: 'delete-highlight', id: markerView.highlighting.annotations.at(-1).id }));
+    await select(page, 26, 31);
+    await toolbar(page).getByRole('button', { name: '新增評論…', exact: true }).click();
+    assert.equal(await page.evaluate(() => markerView.highlighting.annotations.at(-1).color), 'yellow');
+    const anchor = await page.evaluate(() => {
+      const range = markerView.restoreRange(markerView.highlighting.annotations[0].anchor), box = range.getBoundingClientRect();
+      return { x: box.left + 2, y: box.top + box.height / 2 };
+    });
+    await page.mouse.move(anchor.x, anchor.y);
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    assert.equal(await toolbar(page).isVisible(), false, 'existing marks do not show a competing color/delete toolbar');
+    assert.equal(await page.evaluate(() => originalRuns.every(node => markerView.element.contains(node))), true);
+  }, { highlighting: { localEditing: true } });
+});
+
+test('hovering a local mark opens only its floating editor after the selection action', async () => {
+  await inPage('First passage. Second passage.', async page => {
+    await page.evaluate(() => {
+      const projection = markerView.projection; markerView.destroy();
+      document.body.innerHTML = '<div id="mw-content-text"><div class="mw-parser-output">Original</div></div>';
+      window.localMount = annotationLab.annotation.mountWikipediaAnnotation(document, projection, {
+        comments: true, commentAuthor: 'Example', commentAutosave: true, commentFloating: true, commentLinks: false,
+        highlighting: { localEditing: true },
+      });
+      window.markerView = localMount.view;
+    });
+    await select(page, 0, 13);
+    await toolbar(page).getByRole('button', { name: '新增評論…', exact: true }).click();
+    const panel = page.locator('.annotation-comments'), input = panel.getByRole('textbox');
+    await input.waitFor({ state: 'visible' });
+    await input.fill('A local floating note');
+    await page.mouse.click(500, 500);
+    await panel.waitFor({ state: 'hidden' });
+    const anchor = await page.evaluate(() => {
+      const box = markerView.restoreRange(markerView.highlighting.annotations[0].anchor).getBoundingClientRect();
+      return { x: box.left + 2, y: box.top + box.height / 2 };
+    });
+    await page.mouse.move(anchor.x, anchor.y);
+    await input.waitFor({ state: 'visible' });
+    assert.equal(await input.inputValue(), 'A local floating note');
+    assert.equal(await panel.getAttribute('data-layout'), 'floating');
+    assert.equal(await toolbar(page).isVisible(), false);
+    assert.equal(await page.locator('.vector-column-end').count(), 0);
+  });
 });

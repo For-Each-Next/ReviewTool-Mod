@@ -914,7 +914,7 @@ test('formatted file captions preserve selection and give nested links and refer
     assert.equal(await page.evaluate(() => annotationLab.view.readRange(getSelection().getRangeAt(0)).sourceText), '[[页面|标签]]');
     await page.keyboard.press('Escape');
     await caption.locator('[data-inspect="reference"]').click();
-    assert.equal(await page.locator('[data-annotation-popup] pre').textContent(), '<ref name=r>{{cite|x=a|y=b}}</ref>');
+    assert.equal(await page.locator('[data-annotation-popup] pre').textContent(), '<ref name=r>\n{{Cite\n  | x = a\n  | y = b\n}}\n</ref>');
     assert.equal(await page.evaluate(() => annotationLab.view.readRange(getSelection().getRangeAt(0)).sourceText), '<ref name=r>{{cite|x=a|y=b}}</ref>');
     await page.keyboard.press('Escape');
     await page.locator('[data-inspect="image"] > [data-source-run]').first().click();
@@ -1283,5 +1283,59 @@ test('real mouse dragging inside a long paragraph selects a sentence without rew
     assert.equal(result.selection.quote, expected);
     assert.equal(result.selection.sourceText, expected);
     assert.equal(result.stable, true);
+  });
+});
+
+test('hovering a reference formats cite parameters and opens its source links without altering anchors', async () => {
+  await inPage(async page => {
+    const reference = '<ref name="citation">{{cite web|title=示例 [[地球|文章]]|url=https://example.org/read?a=1&amp;b=2|access-date=2026-11-14|quote={{lang|en|A=B}}}}</ref>';
+    await page.evaluate(reference => annotationLab.render('前😀' + reference + '後'), reference);
+    const marker = page.locator('#view [data-inspect="reference"]');
+    await marker.hover();
+    const popup = page.locator('[data-annotation-popup]');
+    assert.equal(await popup.isVisible(), true);
+    assert.equal(await popup.locator('pre').textContent(), [
+      '<ref name="citation">', '{{Cite web',
+      '  | title = 示例 [[地球|文章]]',
+      '  | url = https://example.org/read?a=1&amp;b=2',
+      '  | access-date = 2026-11-14',
+      '  | quote = {{lang|en|A=B}}', '}}', '</ref>',
+    ].join('\n'));
+    assert.deepEqual(await popup.locator('a').evaluateAll(links => links.map(link => [link.textContent, link.getAttribute('href'), link.target, link.rel])), [
+      ['[[地球|文章]]', server.url + '/wiki/%E5%9C%B0%E7%90%83', '_blank', 'noopener noreferrer'],
+      ['https://example.org/read?a=1&amp;b=2', 'https://example.org/read?a=1&b=2', '_blank', 'noopener noreferrer'],
+    ]);
+    await marker.click();
+    const originalSelection = await page.evaluate(() => annotationLab.view.selection);
+    assert.equal(originalSelection.sourceText, reference);
+    const opened = page.waitForEvent('popup');
+    await popup.locator('a').last().click();
+    const tab = await opened;
+    await tab.close();
+    assert.deepEqual(await page.evaluate(() => annotationLab.view.selection), originalSelection);
+    const restored = await page.evaluate(() => annotationLab.view.readRange(annotationLab.view.restoreRange(annotationLab.view.selection.anchor)));
+    assert.equal(restored.sourceText, reference);
+  });
+});
+
+test('reference popup formatting preserves nested citation fields and keeps unsafe source inert', async () => {
+  await inPage(async page => {
+    const reference = '<ref>{{CITE_NEWS|title=<img src=x onerror="window.referenceExecuted=true">|url=javascript:alert(1)|quote=<nowiki>a|b=c</nowiki>|quote={{lang|en|a|b=c}}|}}</ref>';
+    await page.evaluate(reference => annotationLab.render(reference), reference);
+    await page.locator('#view [data-inspect="reference"]').hover();
+    const popup = page.locator('[data-annotation-popup]');
+    assert.equal(await popup.locator('pre').textContent(), [
+      '<ref>', '{{Cite news',
+      '  | title = <img src=x onerror="window.referenceExecuted=true">',
+      '  | url = javascript:alert(1)',
+      '  | quote = <nowiki>a|b=c</nowiki>',
+      '  | quote = {{lang|en|a|b=c}}', '  | ', '}}', '</ref>',
+    ].join('\n'));
+    assert.equal(await popup.locator('img, script, a').count(), 0);
+    assert.equal(await page.evaluate(() => Boolean(window.referenceExecuted)), false);
+    await page.evaluate(() => annotationLab.render('<ref>普通引用 https://example.org/</ref>'));
+    await page.locator('#view [data-inspect="reference"]').hover();
+    assert.equal(await page.locator('[data-annotation-popup] pre').textContent(), '<ref>普通引用 https://example.org/</ref>');
+    assert.equal(await page.locator('[data-annotation-popup] a').getAttribute('href'), 'https://example.org/');
   });
 });

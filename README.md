@@ -1,3 +1,5 @@
+本改版专注于生成评注 wikitext，不会向维基提交编辑或保存 JSON，草稿仅保留在本机浏览器；运行 `npm run build:userscript` 可生成 `dist/reviewtool-mod.user.js`，GitHub Actions 也会自动构建并提供脚本下载。原文档如下：
+
 # ReviewTool
 
 專案頁面：[ReviewTool](https://zh.wikipedia.org/wiki/User:SuperGrey/gadgets/ReviewTool)

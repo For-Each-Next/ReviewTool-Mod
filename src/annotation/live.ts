@@ -1,277 +1,389 @@
 import type { UnknownApiParams } from 'types-mediawiki/api_params';
-import { createApi, mode } from '../mediawiki';
+import { createApi } from '../mediawiki';
+import state from '../state';
+import { addMainPageReviewToolButtonsToDOM } from '../dom/article_page';
 import { createProjection } from './projection';
 import { mountWikipediaAnnotation } from './wikipedia-view';
-import { dataPageTitle, decodePage, type ReviewIdentity } from './live-storage';
-import { wikiSource, type WikiSource } from './wiki-source';
-import { annotationSync } from './sync';
-import { syncJournal } from './sync-journal';
-import type { CommentDraft, ModerationReasonPrompt, WikipediaHeadingAnchor } from './types';
-import styles from './style.css';
-import { annotationVisible, threadRoots } from './annotation-state';
-import { findComment, isModerator } from './permissions';
-import { createCodexReasonPrompt } from './codex-reason-dialog';
-import { addMainPageReviewToolButtonsToDOM } from '../dom/article_page';
-import state from '../state';
-import { buildAnnotationExport, downloadAnnotationExport } from './export';
+import { buildReviewWikitext } from './export';
 import { annotationMessages } from './i18n';
 import { showAnnotationLoading } from './loading-view';
-import { activationParameter, annotationViewUrl, annotationCommentUrl, commentParameter } from './view-url';
-import { commentIdFromUrl } from './uuid';
-import { browserVisits, activityNotice, annotationDestination, notifyAnnotationLink } from './notifications';
-import { activityTracker } from './activity-tracker';
-import { subscriptionControl } from './subscription-control';
-import { textRects } from './range-rects';
+import { activationParameter, annotationViewUrl, commentParameter } from './view-url';
+import { threadRoots } from './annotation-state';
+import type { ReviewIdentity } from './live-storage';
+import type { AnnotationComment, CommentDraft, HighlightAnnotation, Projection, WikipediaHeadingAnchor } from './types';
 
 export { activationParameter } from './view-url';
-interface ParsedRevision { parse: { title: string; pageid: number; revid: number; wikitext: string; tocdata?: { sections?: { fromTitle?: string; codepointOffset?: number; hLevel: number; anchor: string }[] } } }
-function response<T>(request: mw.Api.AbortablePromise): Promise<T> {
-  return new Promise((resolve, reject) => { request.done(value => resolve(value as T)).fail((code: unknown) => reject(new Error(typeof code === 'string' ? code : 'MediaWiki request failed'))); });
+interface Snapshot { annotations: readonly HighlightAnnotation[]; drafts: readonly CommentDraft[] }
+interface StoredDraft extends Snapshot {
+  schema: 1;
+  identity: ReviewIdentity;
+  author: string;
+  undoClear: Snapshot | null;
+  updatedAt: number;
+}
+interface ReviewedSource { projection: Projection; headings: WikipediaHeadingAnchor[] }
+interface ParsedRevision { parse?: { title: string; pageid: number; revid: number; wikitext: string; tocdata?: { sections?: { fromTitle?: string; codepointOffset?: number; hLevel: number; anchor: string }[] } } }
+type MutableComment = Omit<AnnotationComment, 'replies'> & { text: string; editedBy?: string; replies: MutableComment[] };
+const labels = (text: { hant: string; hans: string }) => state.conv(text);
+const draftPrefix = 'reviewtool-wikitext-v1';
+
+export function reviewDraftKey(identity: ReviewIdentity, author: string): string {
+  return [draftPrefix, identity.wiki, identity.pageId, identity.revisionId, author].map(value => encodeURIComponent(value)).join('/');
 }
 
-/** One revision-bound view, entered through the existing article tab and action menu. */
+function storedDraft(raw: string | null, identity: ReviewIdentity, author: string): StoredDraft | null {
+  if (!raw) return null;
+  const value = JSON.parse(raw) as Partial<StoredDraft>;
+  if (value.schema !== 1 || value.author !== author || value.identity?.wiki !== identity.wiki || value.identity.pageId !== identity.pageId || value.identity.revisionId !== identity.revisionId || !Array.isArray(value.annotations) || !Array.isArray(value.drafts)) throw new Error('The browser draft does not match this article revision and user.');
+  return value as StoredDraft;
+}
+
+function hasWork(content: Snapshot | null | undefined): boolean {
+  return Boolean(content?.annotations.some(item => item && !item.deleted) || content?.drafts.some(draft => typeof draft?.text === 'string' && draft.text.trim()));
+}
+function cloneComment(comment: AnnotationComment): MutableComment {
+  return { ...comment, replies: comment.replies.map(cloneComment) };
+}
+function cloneSnapshot(content: Snapshot): Snapshot {
+  return { annotations: content.annotations.map(annotation => {
+    const copy = { ...annotation, anchor: { ...annotation.anchor }, threads: threadRoots(annotation).map(cloneComment) };
+    delete copy.comment; return copy;
+  }), drafts: content.drafts.map(draft => ({ ...draft })) };
+}
+function mergeComments(previous: readonly AnnotationComment[], current: readonly AnnotationComment[]): MutableComment[] {
+  const merged = new Map(previous.map(comment => [comment.id, cloneComment(comment)]));
+  for (const comment of current) merged.set(comment.id, { ...comment, replies: mergeComments(merged.get(comment.id)?.replies ?? [], comment.replies) });
+  return [...merged.values()];
+}
+/** Keep post-clear input and independent notes when restoring or merging tabs. */
+export function mergeReviewSnapshots(previous: Snapshot, current: Snapshot): Snapshot {
+  const annotations = new Map(previous.annotations.map(annotation => [annotation.id, annotation]));
+  for (const annotation of current.annotations) annotations.set(annotation.id, { ...annotation, threads: mergeComments(threadRoots(annotations.get(annotation.id) ?? annotation), threadRoots(annotation)) });
+  const key = (draft: CommentDraft) => JSON.stringify([draft.annotationId, draft.kind, 'commentId' in draft ? draft.commentId : '']);
+  const drafts = new Map(previous.drafts.map(draft => [key(draft), draft]));
+  for (const draft of current.drafts) {
+    const before = drafts.get(key(draft))?.text ?? '', after = draft.text;
+    drafts.set(key(draft), { ...draft, text: before && after && before !== after ? `${before}\n\n${after}` : after || before });
+  }
+  return { annotations: [...annotations.values()], drafts: [...drafts.values()] };
+}
+
+/** Three-way tab reconciliation keeps remote removals and independent local additions. */
+export function reconcileReviewSnapshots(base: Snapshot, remote: Snapshot, local: Snapshot): Snapshot {
+  const same = (left: unknown, right: unknown) => JSON.stringify(left) === JSON.stringify(right);
+  const before = new Map(base.annotations.map(item => [item.id, item]));
+  const incoming = new Map(remote.annotations.map(item => [item.id, item]));
+  const current = new Map(local.annotations.map(item => [item.id, item]));
+  const annotations: HighlightAnnotation[] = [];
+  for (const id of new Set([...incoming.keys(), ...current.keys()])) {
+    const original = before.get(id), other = incoming.get(id), own = current.get(id);
+    let annotation: HighlightAnnotation | undefined;
+    if (same(own, original)) annotation = other;
+    else if (same(other, original)) annotation = own;
+    else if (!own || !other) annotation = original ? undefined : own ?? other;
+    else if (other.deleted || own.deleted) annotation = other.deleted ? other : own;
+    else annotation = { ...other, ...own, threads: mergeComments(threadRoots(other), threadRoots(own)) };
+    if (annotation) annotations.push(annotation);
+  }
+  const draftKey = (draft: CommentDraft) => JSON.stringify([draft.annotationId, draft.kind, 'commentId' in draft ? draft.commentId : '']);
+  const originalDrafts = new Map(base.drafts.map(draft => [draftKey(draft), draft]));
+  const otherDrafts = new Map(remote.drafts.map(draft => [draftKey(draft), draft]));
+  const ownDrafts = new Map(local.drafts.map(draft => [draftKey(draft), draft]));
+  const liveIds = new Set(annotations.filter(item => !item.deleted).map(item => item.id));
+  const drafts: CommentDraft[] = [];
+  for (const key of new Set([...otherDrafts.keys(), ...ownDrafts.keys()])) {
+    const original = originalDrafts.get(key), other = otherDrafts.get(key), own = ownDrafts.get(key);
+    let draft: CommentDraft | undefined;
+    if (same(own, original)) draft = other;
+    else if (same(other, original)) draft = own;
+    else if (!own || !other) draft = own ?? other;
+    else {
+      const beforeText = other.text, afterText = own.text;
+      const text = beforeText === afterText || !beforeText || afterText.includes(beforeText) ? afterText
+        : !afterText || beforeText.includes(afterText) ? beforeText : `${beforeText}\n\n${afterText}`;
+      draft = { ...own, text };
+    }
+    if (draft && liveIds.has(draft.annotationId)) drafts.push(draft);
+  }
+  return { annotations, drafts };
+}
+
+/** Overlay unsent text on a copy, so exporting never needs a submit/save step. */
+export function reviewExportAnnotations(annotations: readonly HighlightAnnotation[], drafts: readonly CommentDraft[], author: string): HighlightAnnotation[] {
+  const result = cloneSnapshot({ annotations, drafts: [] }).annotations.map(annotation => ({ ...annotation, threads: threadRoots(annotation).map(cloneComment) }));
+  const find = (comments: MutableComment[], id: string): MutableComment | undefined => {
+    for (const comment of comments) { if (comment.id === id) return comment; const child = find(comment.replies, id); if (child) return child; }
+    return undefined;
+  };
+  drafts.forEach((draft, index) => {
+    const annotation = result.find(item => item.id === draft.annotationId && !item.deleted);
+    if (!annotation) return;
+    if (draft.kind === 'edit') {
+      const comment = find(annotation.threads, draft.commentId);
+      if (comment) { comment.text = draft.text; comment.editedBy = author; }
+    } else if (draft.text.trim()) {
+      const comment = { id: `local-input-${index}`, text: draft.text, author, createdAt: new Date().toISOString(), replies: [] };
+      if (draft.kind === 'reply') find(annotation.threads, draft.commentId)?.replies.push(comment);
+      else annotation.threads.push(comment);
+    }
+  });
+  return result;
+}
+
+/** An article-only local session. The only API request reads the displayed revision. */
 export async function initLiveAnnotation(): Promise<boolean> {
-  const namespace = mw.config.get('wgNamespaceNumber');
-  if ((namespace !== 0 && mw.config.get('wgPageName') !== 'User:SuperGrey/gadgets/ReviewTool/TestPage') || mw.config.get('wgAction') !== 'view' || !mw.config.get('wgRevisionId')) return false;
+  const revision = mw.config.get('wgRevisionId'), pageId = mw.config.get('wgArticleId');
+  if (mw.config.get('wgNamespaceNumber') !== 0 || mw.config.get('wgAction') !== 'view' || !Number.isSafeInteger(revision) || revision < 1 || !Number.isSafeInteger(pageId) || pageId < 1 || mw.config.get('wgDiffOldId') || mw.config.get('wgDiffNewId') || new URL(location.href).searchParams.has('diff')) return false;
   if (document.getElementById('ca-annotate')) return true;
-  let session: ReturnType<typeof startLiveAnnotation> | undefined, closing = false;
-  const revision = mw.config.get('wgRevisionId');
-  const api = createApi(), author = mw.config.get('wgUserName') || (mode === 'dry-run' ? 'Example' : 'Anonymous');
-  const canWrite = mode === 'dry-run' || Boolean(mw.config.get('wgUserName'));
-  const storageTitle = dataPageTitle(revision);
-  const talkTitle = mw.Title.newFromText(mw.config.get('wgPageName'))?.getTalkPage()?.getPrefixedText();
-  if (!talkTitle) throw new Error('This page has no associated talk page for annotations.');
-  const sourceApi = wikiSource(async (params, write) => {
-    if (write && !canWrite) throw new Error('Log in before saving annotations.');
-    return response(write ? api.postWithToken('csrf', { ...params, ...(mode === 'normal' ? { assert: 'user', assertuser: author } : {}) }) : api.get(params as UnknownApiParams));
-  }, storageTitle, { talkTitle, revisionId: revision, summary: state.conv({ hant: '更新批註版本索引', hans: '更新批注版本索引' }) });
-  const updateUrl = (active: boolean) => {
-    const url = new URL(location.href);
-    if (active) url.searchParams.set(activationParameter, '1');
-    else { url.searchParams.delete(activationParameter); url.searchParams.delete(commentParameter); }
-    history.replaceState(history.state, '', url.href);
-  };
-  const toggle = async () => {
-    if (closing) return;
-    if (session) {
-      closing = true;
-      const previous = session; session = undefined;
-      updateUrl(false); navigation.update(false, true);
-      try { await previous.close(); } finally { closing = false; navigation.update(false); }
-      return;
-    }
-    const url = annotationViewUrl(location.href, revision, mw.config.get('skin'));
-    const currentUrl = new URL(location.href);
-    if (currentUrl.searchParams.get('oldid') !== String(revision) || currentUrl.searchParams.get('useskin') !== url.searchParams.get('useskin')) {
-      location.assign(url.href); return;
-    }
-    updateUrl(true); navigation.update(true, true);
-    const opened = startLiveAnnotation(api, sourceApi); session = opened;
-    await opened.ready;
-    if (session === opened) navigation.update(true);
-  };
-  const navigation = addMainPageReviewToolButtonsToDOM(() => { void toggle(); }); navigation.update(false);
-  if (new URL(location.href).searchParams.get(activationParameter) === '1' || new URL(location.href).searchParams.has(commentParameter)) await toggle();
-  return true;
-}
-
-/** Own all requests, listeners, drafts and mounted DOM for one opening of Annotation View. */
-function startLiveAnnotation(api: mw.Api, sourceApi: WikiSource) {
-  const revision = mw.config.get('wgRevisionId'), title = mw.config.get('wgPageName').replace(/_/g, ' ');
-  const author = mw.config.get('wgUserName') || (mode === 'dry-run' ? 'Example' : 'Anonymous');
-  const actor = { name: author, groups: mw.config.get('wgUserGroups') ?? [] }, canWrite = mode === 'dry-run' || Boolean(mw.config.get('wgUserName'));
-  const identity: ReviewIdentity = { wiki: mw.config.get('wgDBname'), pageId: mw.config.get('wgArticleId'), revisionId: revision };
-  const style = document.createElement('style'); style.textContent = styles; document.head.append(style);
+  const identity: ReviewIdentity = { wiki: mw.config.get('wgDBname'), pageId, revisionId: revision };
+  const author = mw.config.get('wgUserName') || 'Anonymous';
+  const pageName = mw.config.get('wgPageName').replace(/_/g, ' '), key = reviewDraftKey(identity, author);
+  const api = createApi();
+  let annotations: readonly HighlightAnnotation[] = [], drafts: readonly CommentDraft[] = [], undoClear: Snapshot | null = null;
+  let storageSnapshot: string | null = null, storageFailed = false, pendingUpdate = false, applying = false, bulkBusy = false, opening = false;
+  let mounted: ReturnType<typeof mountWikipediaAnnotation> | null = null, source: ReviewedSource | null = null;
+  let toolbar: HTMLElement | null = null, status: HTMLElement | null = null, exportButton: HTMLButtonElement | null = null, clearButton: HTMLButtonElement | null = null, undoButton: HTMLButtonElement | null = null, syncButton: HTMLButtonElement | null = null;
+  let exportDialog: HTMLDialogElement | null = null, stopLoading: (() => void) | null = null;
+  let generation = 0, version = 0, exportedVersion = 0, bulkStatus = '';
+  let pendingRemote: StoredDraft | null = null, pendingBase: StoredDraft | null = null, localUndoChanged = false;
   const messages = annotationMessages(text => state.conv(text));
-  const stopLoading = showAnnotationLoading(document, messages.loadingView);
-  let exportItem: HTMLElement | null = null;
-  let mount: ReturnType<typeof mountWikipediaAnnotation> | undefined, sync: ReturnType<typeof annotationSync> | undefined;
-  let closed = false, polling: ReturnType<typeof setInterval> | undefined;
-  let activity: ReturnType<typeof activityTracker> | undefined;
-  const activityNotices: { close(): void }[] = [];
-  let saveDrafts: (drafts?: readonly CommentDraft[]) => Promise<void> = async () => {};
-  const controller = new AbortController(), listener = { signal: controller.signal };
-  let notice: { close(): void } | undefined, lastNotice = '';
-  const notify = (message: string | HTMLElement, type: 'warn' | 'error' = 'error') => {
-    void mw.notify(message, { tag: 'reviewtool-annotations', type, autoHide: false }).then(result => {
-      if (closed) result.close(); else notice = result;
-    });
-  };
-  const failure = (label: { hant: string; hans: string }, error: unknown) => {
-    if (closed) return;
+  const notifyError = (message: { hant: string; hans: string }, error: unknown) => {
     console.error('[ReviewTool]', error);
-    notify(state.conv(label));
+    void mw.notify(labels(message), { autoHide: false, tag: 'reviewtool-local-error', type: 'error' });
   };
-  const setStatus = (message: string, error = false) => {
-    if (closed) return;
-    const hiddenDrafts = (mount?.view.comments?.drafts ?? []).filter(draft => {
-      const annotation = sync?.annotations.find(item => item.id === draft.annotationId);
-      return draft.text.trim() && (!annotation || !annotationVisible(annotation) || (draft.kind !== 'new' && !threadRoots(annotation).some(root => !root.resolved && findComment(root, draft.commentId))));
-    });
-    const retained = sync?.retained ?? [];
-    const lateReply = message === 'Reply saved in a discussion that has been resolved or removed.';
-    if (!error && !retained.length && !hiddenDrafts.length && !lateReply) {
-      if (message === 'Up to date') { notice?.close(); notice = undefined; lastNotice = ''; }
-      return;
+  function restore(saved: StoredDraft, raw: string | null) {
+    annotations = saved.annotations; drafts = saved.drafts;
+    undoClear = saved.undoClear && Array.isArray(saved.undoClear.annotations) && Array.isArray(saved.undoClear.drafts) ? saved.undoClear : null;
+    storageSnapshot = raw; storageFailed = false; pendingUpdate = false; pendingRemote = null; pendingBase = null; localUndoChanged = false;
+  }
+  try { const raw = localStorage.getItem(key), saved = storedDraft(raw, identity, author); if (saved && raw) restore(saved, raw); }
+  catch (error) { storageFailed = true; notifyError({ hant: '無法讀取本機草稿。新的批註仍可複製或下載為維基文字。', hans: '无法读取本地草稿。新的批注仍可复制或下载为维基文本。' }, error); }
+  const initialHasWork = hasWork({ annotations, drafts }) || hasWork(undoClear);
+  function capture(): Snapshot { return cloneSnapshot({ annotations: mounted?.view.highlighting?.annotations ?? annotations, drafts: mounted?.view.comments?.drafts ?? drafts }); }
+  function updateToolbar() {
+    if (!toolbar || !status || !exportButton || !clearButton || !undoButton || !syncButton) return;
+    const count = combined({ annotations, drafts }).annotations.filter(item => !item.deleted).length;
+    exportButton.disabled = bulkBusy || count === 0;
+    clearButton.disabled = bulkBusy || !(annotations.length || drafts.length);
+    undoButton.hidden = !undoClear; undoButton.disabled = bulkBusy;
+    syncButton.hidden = !pendingUpdate; syncButton.disabled = bulkBusy || opening;
+    status.textContent = labels(storageFailed ? { hant: `${count} 項批註；請在離開前複製或下載。`, hans: `${count} 项批注；请在离开前复制或下载。` }
+      : pendingUpdate ? { hant: '其他分頁有更新；離開輸入框後載入，或按「載入分頁更新」。', hans: '其他分页有更新；离开输入框后载入，或按「载入分页更新」。' }
+      : bulkStatus === 'cleared' ? { hant: '已清除所有評論及標記，可按「撤銷刪除」還原。', hans: '已清除所有评论和标记，可按「撤销删除」还原。' }
+      : bulkStatus === 'deleted' ? { hant: '已刪除批註，可按「撤銷刪除」還原。', hans: '已删除批注，可按「撤销删除」还原。' }
+      : bulkStatus === 'restored' ? { hant: '已復原評論、標記及輸入內容。', hans: '已恢复评论、标记和输入内容。' }
+      : { hant: `${count} 項批註；草稿保留在此瀏覽器。`, hans: `${count} 项批注；草稿保留在此浏览器。` });
+  }
+  function emptyStoredDraft(): StoredDraft {
+    return { schema: 1, identity, author, annotations: [], drafts: [], undoClear: null, updatedAt: 0 };
+  }
+  function readRemote() {
+    const raw = localStorage.getItem(key);
+    if (raw !== storageSnapshot) {
+      pendingBase ??= storedDraft(storageSnapshot, identity, author) ?? emptyStoredDraft();
+      pendingRemote = storedDraft(raw, identity, author) ?? emptyStoredDraft();
     }
-    const signature = JSON.stringify([message, retained.map(entry => entry.id), hiddenDrafts]);
-    if (signature === lastNotice) return;
-    lastNotice = signature;
-    if (error) console.warn('[ReviewTool]', message);
-    const content = document.createElement('div');
-    const text = document.createElement('p');
-    text.textContent = state.conv(retained.length
-      ? { hant: '批註資料頁已被手動修改。您的修改尚未同步，請檢查後重新儲存，或放棄修改。', hans: '批注数据页已被手动修改。您的修改尚未同步，请检查后重新保存，或放弃修改。' }
-      : lateReply ? { hant: '回覆已儲存，但原討論已結束或刪除，不會再顯示。', hans: '回复已保存，但原讨论已结束或删除，不会再显示。' }
-      : hiddenDrafts.length ? { hant: '原討論已不再顯示。以下是尚未送出的草稿：', hans: '原讨论已不再显示。以下是尚未发送的草稿：' }
-      : { hant: '批註暫時無法同步，請稍後再試。', hans: '批注暂时无法同步，请稍后再试。' });
-    content.append(text);
-    for (const entry of retained) {
-      const item = document.createElement('p'), action = entry.action;
-      item.textContent = action.type === 'edit-comment' ? action.text : action.type === 'add-comment' ? action.comment.text
-        : state.conv(action.type === 'set-thread-resolution' ? { hant: action.resolved ? '標記已解決' : '標記尚未解決', hans: action.resolved ? '标记已解决' : '标记尚未解决' }
-          : action.type === 'resolve-comment' ? { hant: '結束討論', hans: '结束讨论' }
-          : action.type === 'delete-highlight' ? { hant: '刪除高亮', hans: '删除高亮' }
-          : action.type === 'recolor-highlight' ? { hant: '更改高亮顏色', hans: '更改高亮颜色' } : { hant: '新增高亮', hans: '添加高亮' });
-      content.append(item);
+    if (pendingRemote && !localUndoChanged) {
+      undoClear = pendingRemote.undoClear && Array.isArray(pendingRemote.undoClear.annotations) && Array.isArray(pendingRemote.undoClear.drafts) ? pendingRemote.undoClear : null;
     }
-    for (const draft of hiddenDrafts) { const text = document.createElement('pre'); text.textContent = draft.text; text.style.whiteSpace = 'pre-wrap'; content.append(text); }
-    const action = (label: { hant: string; hans: string }, run: () => Promise<unknown> | undefined) => {
-      const button = document.createElement('button'); button.type = 'button'; button.textContent = state.conv(label);
-      button.addEventListener('click', () => { button.disabled = true; void run()?.catch(error => failure({ hant: '操作未完成，請稍後重試。', hans: '操作未完成，请稍后重试。' }, error)).finally(() => { button.disabled = false; }); }, listener);
-      content.append(button);
-    };
-    if (retained.length) {
-      action({ hant: '重新儲存', hans: '重新保存' }, () => sync?.resubmit());
-      action({ hant: '放棄修改', hans: '放弃修改' }, () => sync?.discardRetained());
-    } else if (error) action({ hant: '重試', hans: '重试' }, () => sync?.sync());
-    notify(content, error ? 'error' : 'warn');
-  };
-  const ready = (async () => {
+  }
+  function combined(content: Snapshot): Snapshot {
+    return pendingRemote ? reconcileReviewSnapshots(pendingBase ?? emptyStoredDraft(), pendingRemote, content) : content;
+  }
+  function save(authoritative = false) {
+    if (applying) return;
     try {
-      const journalKey = [mode, identity.wiki, identity.pageId, revision, author].join('/');
-      const draftSlot = 'reviewtool-draft-session/' + journalKey;
-      const draftSession = sessionStorage.getItem(draftSlot) ?? crypto.randomUUID(); sessionStorage.setItem(draftSlot, draftSession);
-      const journal = syncJournal(journalKey + '/' + dataPageTitle(revision), draftSession, journalKey);
-      const configuredVariant: unknown = mw.config.get('wgUserVariant');
-      const [parsed, requestModerationReason, drafts] = await Promise.all([
-        response<ParsedRevision>(api.get({ action: 'parse', oldid: revision, prop: 'wikitext|tocdata|revid', formatversion: 2, variant: typeof configuredVariant === 'string' ? configuredVariant : 'zh' })),
-        isModerator(actor) ? createCodexReasonPrompt(document, messages) : Promise.resolve<ModerationReasonPrompt | undefined>(undefined), journal.drafts(),
-      ]);
-      if (closed) return;
-      if (parsed.parse.revid !== revision || parsed.parse.pageid !== identity.pageId || typeof parsed.parse.wikitext !== 'string') throw new Error('Source revision does not match the displayed article.');
-      const source = parsed.parse.wikitext, bytes = [0], encoder = new TextEncoder();
-      for (const char of source) bytes.push(bytes[bytes.length - 1] + encoder.encode(char).length);
-      const headings: WikipediaHeadingAnchor[] = [];
-      for (const section of parsed.parse.tocdata?.sections ?? []) {
-        if (section.fromTitle?.replace(/_/g, ' ') !== parsed.parse.title.replace(/_/g, ' ') || section.codepointOffset === undefined || section.codepointOffset < 0) continue;
-        const start = bytes[section.codepointOffset]; if (start === undefined) throw new Error('Heading offset is outside this source revision.');
-        headings.push({ unit: 'utf8-byte', start, level: section.hLevel, id: section.anchor });
-      }
-      const byteLength = bytes[bytes.length - 1], boundaries = new Set(bytes);
-      const validate: Parameters<typeof annotationSync>[0]['validate'] = anchor => Boolean(anchor && anchor.unit === 'utf8-byte' && anchor.start < anchor.end && anchor.end <= byteLength && boundaries.has(anchor.start) && boundaries.has(anchor.end));
-      sync = annotationSync({ identity, actor, source: sourceApi, journal, canWrite, status: setStatus, validate,
-        changed: annotations => { if (!closed) mount?.view.highlighting?.replace(annotations); },
-        published: snapshot => { if (!closed) void activity?.receive(snapshot); },
-      });
-      const shared = sync, initial = await shared.start();
-      if (closed) return;
-      const projection = createProjection(source, { wikiBaseUrl: new URL('/wiki/', location.href).href });
-      saveDrafts = (snapshot = mount?.view.comments?.drafts ?? drafts) => journal.drafts(snapshot).then(() => {}).catch(error => failure({ hant: '無法儲存草稿，請先複製文字，以免遺失。', hans: '无法保存草稿，请先复制文字，以免丢失。' }, error));
-      stopLoading();
-      mount = mountWikipediaAnnotation(document, projection, {
-        comments: true, messages, commentAuthor: author, commentUserGroups: actor.groups, commentCanWrite: canWrite, headingAnchors: headings, commentDrafts: drafts,
-        commentLink: id => annotationCommentUrl(location.href, id, revision).href,
-        onCommentLinkUnavailable: () => { if (!closed) notify(messages.commentUnavailable, 'warn'); },
-        onCommentLinkCopy: copied => {
-          if (!closed) void mw.notify(copied ? messages.linkCopied : messages.linkCopyFailed, { tag: 'reviewtool-comment-link', type: copied ? 'success' : 'error', autoHide: true });
-        },
-        onCommentDraftsChange: snapshot => { if (!closed) void saveDrafts(snapshot); },
-        ...(requestModerationReason ? { requestModerationReason } : {}),
-        requestCloseConfirmation: async signal => {
-          const prompt = requestModerationReason ?? await createCodexReasonPrompt(document, messages);
-          return await prompt('confirm-close', signal) !== null;
-        },
-        highlighting: { initial, onChange: (_next, action) => {
-          try { if (!canWrite) throw new Error('Log in before saving annotations.'); shared.add(action); } catch (error) { mount?.view.highlighting?.replace(shared.annotations); failure({ hant: '修改未能儲存，請再試一次。', hans: '修改未能保存，请再试一次。' }, error); }
+      if (authoritative) { pendingRemote = null; pendingBase = null; pendingUpdate = false; }
+      else readRemote();
+      const content = combined({ annotations, drafts });
+      const saved: StoredDraft = { schema: 1, identity, author, ...content, undoClear, updatedAt: Date.now() };
+      const raw = JSON.stringify(saved); localStorage.setItem(key, raw);
+      storageSnapshot = raw; storageFailed = false; pendingUpdate = pendingRemote !== null;
+      // Once committed, this slot is the baseline for the next deletion in any tab.
+      if (localUndoChanged && pendingRemote) pendingRemote = { ...pendingRemote, undoClear };
+      localUndoChanged = false;
+    } catch (error) {
+      if (!storageFailed) notifyError({ hant: '無法保留本機草稿。離開頁面前請先複製或下載批註。', hans: '无法保留本地草稿。离开页面前请先复制或下载批注。' }, error);
+      storageFailed = true;
+    }
+    updateToolbar();
+  }
+  function changed() { bulkStatus = ''; version++; save(); }
+  async function readSource(): Promise<ReviewedSource> {
+    if (source) return source;
+    const variant = mw.config.get('wgUserVariant');
+    const value = await new Promise<ParsedRevision>((resolve, reject) => {
+      api.get({ action: 'parse', oldid: revision, prop: 'wikitext|tocdata|revid', formatversion: 2, variant: typeof variant === 'string' ? variant : 'zh' } as UnknownApiParams).done(response => resolve(response as ParsedRevision)).fail((code: unknown) => reject(new Error(typeof code === 'string' ? code : 'Unable to read article source.')));
+    });
+    const parsed = value.parse;
+    if (!parsed || parsed.revid !== revision || parsed.pageid !== pageId || typeof parsed.wikitext !== 'string') throw new Error('Source does not match the displayed article revision.');
+    const offsets = [0], encoder = new TextEncoder();
+    for (const character of parsed.wikitext) offsets.push(offsets[offsets.length - 1] + encoder.encode(character).length);
+    const headings: WikipediaHeadingAnchor[] = [];
+    for (const section of parsed.tocdata?.sections ?? []) {
+      if (section.fromTitle?.replace(/_/g, ' ') !== parsed.title.replace(/_/g, ' ') || !Number.isInteger(section.codepointOffset) || section.codepointOffset === undefined || section.codepointOffset < 0) continue;
+      const start = offsets[section.codepointOffset];
+      if (start === undefined) throw new Error('A heading lies outside the source revision.');
+      headings.push({ unit: 'utf8-byte', start, level: section.hLevel, id: section.anchor });
+    }
+    source = { projection: createProjection(parsed.wikitext, { wikiBaseUrl: new URL('/wiki/', location.href).href }), headings };
+    return source;
+  }
+  function closeView() {
+    generation++; opening = false; stopLoading?.(); stopLoading = null;
+    if (mounted) {
+      const content = capture(); annotations = content.annotations; drafts = content.drafts;
+      mounted.destroy(); mounted = null;
+    }
+    toolbar?.remove(); toolbar = null; exportDialog?.remove(); exportDialog = null;
+  }
+  function button(text: string, action: () => void): HTMLButtonElement {
+    const result = document.createElement('button'); result.type = 'button'; result.textContent = text; result.addEventListener('click', action); return result;
+  }
+  function download(text: string) {
+    const url = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' }));
+    const link = document.createElement('a'); link.href = url; link.download = `reviewtool-${revision}-wikitext.txt`;
+    document.body.append(link); try { link.click(); exportedVersion = version; } finally { link.remove(); window.setTimeout(() => URL.revokeObjectURL(url), 1000); }
+  }
+  function showExport() {
+    if (!source || !annotations.some(item => !item.deleted)) return;
+    exportDialog?.remove();
+    const dialog = document.createElement('dialog'); dialog.className = 'reviewtool-export-dialog'; dialog.setAttribute('aria-labelledby', 'reviewtool-export-title');
+    const heading = document.createElement('h2'); heading.id = 'reviewtool-export-title'; heading.textContent = labels({ hant: '匯出批註為維基文字', hans: '导出批注为维基文本' });
+    const description = document.createElement('p'); description.textContent = labels({ hant: '輸入的批註已包含在下方維基文字中，可直接複製或下載。', hans: '输入的批注已包含在下方维基文本中，可直接复制或下载。' });
+    const textarea = document.createElement('textarea'); textarea.readOnly = true; textarea.spellcheck = false; textarea.setAttribute('aria-label', heading.textContent);
+    const content = combined(capture()); textarea.value = buildReviewWikitext(identity, pageName, source.projection, reviewExportAnnotations(content.annotations, content.drafts, author), source.headings);
+    const feedback = document.createElement('p'); feedback.className = 'reviewtool-export-status'; feedback.setAttribute('role', 'status');
+    const actions = document.createElement('div'); actions.className = 'reviewtool-export-actions';
+    const copy = button(labels({ hant: '複製', hans: '复制' }), () => { void (async () => {
+      let copied = false; copy.disabled = true;
+      try { await navigator.clipboard.writeText(textarea.value); copied = true; } catch { textarea.focus(); textarea.select(); try { copied = document.execCommand('copy'); } catch { /* Selectable fallback remains available. */ } }
+      copy.disabled = false;
+      feedback.textContent = labels(copied ? { hant: '已複製維基文字。', hans: '已复制维基文本。' } : { hant: '文字已選取，請按 Ctrl+C 或 Command+C 複製。', hans: '文本已选中，请按 Ctrl+C 或 Command+C 复制。' });
+      if (copied) exportedVersion = version;
+    })(); });
+    const remove = () => { dialog.remove(); if (exportDialog === dialog) exportDialog = null; exportButton?.focus(); };
+    actions.append(copy, button(labels({ hant: '下載 .txt', hans: '下载 .txt' }), () => download(textarea.value)), button(messages.close, remove));
+    dialog.addEventListener('cancel', event => { event.preventDefault(); remove(); });
+    dialog.append(heading, description, textarea, feedback, actions); document.body.append(dialog); exportDialog = dialog;
+    if (typeof dialog.showModal === 'function') dialog.showModal(); else dialog.setAttribute('open', '');
+    textarea.focus(); textarea.select();
+  }
+  async function replace(content: Snapshot, undo: Snapshot | null) {
+    const wasOpen = Boolean(mounted), position = { left: window.scrollX, top: window.scrollY };
+    closeView(); annotations = content.annotations; drafts = content.drafts; undoClear = undo; localUndoChanged = true; version++; save(true);
+    if (wasOpen) { await openView(); window.scrollTo(position); }
+  }
+  async function bulk(restoreClear: boolean) {
+    if (bulkBusy || (restoreClear && !undoClear)) return;
+    bulkBusy = true; updateToolbar();
+    try {
+      try { readRemote(); } catch { /* Storage failures are reported by save; the local action remains usable. */ }
+      const content = combined(capture());
+      if (restoreClear && undoClear) { const removedIds = new Set(undoClear.annotations.map(item => item.id));
+        await replace(mergeReviewSnapshots(undoClear, { ...content, annotations: content.annotations.filter(item => !item.deleted || !removedIds.has(item.id)) }), null); bulkStatus = 'restored'; }
+      else { await replace({ annotations: [], drafts: [] }, content); bulkStatus = 'cleared'; }
+    } catch (error) { notifyError({ hant: '無法更新批註畫面。請重新開啟批註模式。', hans: '无法更新批注界面。请重新打开批注模式。' }, error); }
+    finally { bulkBusy = false; updateToolbar(); (restoreClear ? clearButton : undoButton)?.focus({ preventScroll: true }); }
+  }
+  function mountToolbar() {
+    if (!mounted) return;
+    toolbar = document.createElement('div'); toolbar.className = 'reviewtool-local-toolbar';
+    status = document.createElement('span'); status.setAttribute('role', 'status');
+    exportButton = button(labels({ hant: '匯出批註為維基文字', hans: '导出批注为维基文本' }), showExport); exportButton.id = 'reviewtool-export-wikitext';
+    clearButton = button(labels({ hant: '清除所有評論及標記', hans: '清除所有评论和标记' }), () => { void bulk(false); }); clearButton.id = 'reviewtool-clear-comments';
+    undoButton = button(labels({ hant: '撤銷刪除', hans: '撤销删除' }), () => { void bulk(true); }); undoButton.id = 'reviewtool-undo-clear';
+    syncButton = button(labels({ hant: '載入分頁更新', hans: '载入分页更新' }), () => { void refresh(true); }); syncButton.id = 'reviewtool-sync-draft';
+    const actions = document.createElement('div'); actions.className = 'reviewtool-local-toolbar-actions'; actions.append(clearButton, undoButton, syncButton, exportButton);
+    toolbar.append(status, actions); mounted.original.before(toolbar); updateToolbar();
+  }
+  async function openView() {
+    const token = ++generation; opening = true;
+    stopLoading = showAnnotationLoading(document, messages.loadingView);
+    try {
+      const reviewed = await readSource();
+      if (token !== generation) return;
+      stopLoading?.(); stopLoading = null;
+      mounted = mountWikipediaAnnotation(document, reviewed.projection, {
+        comments: true, messages, commentAuthor: author, commentUserGroups: [], commentCanWrite: true,
+        commentAutosave: true, commentFloating: true,
+        commentLinks: false, commentDrafts: drafts, headingAnchors: reviewed.headings,
+        onCommentDraftsChange(next) { drafts = next; changed(); },
+        highlighting: { initial: annotations, localEditing: true, onChange(next, action) {
+          if (action.type === 'delete-highlight') {
+            // One persisted slot: each new deletion replaces the preceding Undo.
+            undoClear = cloneSnapshot({ annotations: annotations.filter(item => item.id === action.id), drafts: drafts.filter(draft => draft.annotationId === action.id) });
+            localUndoChanged = true;
+          }
+          annotations = next; changed();
+          if (action.type === 'delete-highlight') { bulkStatus = 'deleted'; updateToolbar(); }
         } },
       });
-      if (closed) return;
+      mountToolbar();
+    } finally { if (token === generation) { opening = false; stopLoading?.(); stopLoading = null; } }
+  }
+  function updateUrl() {
+    const url = new URL(location.href); url.searchParams.delete(commentParameter);
+    if (mounted || opening) url.searchParams.set(activationParameter, '1'); else url.searchParams.delete(activationParameter);
+    history.replaceState(history.state, '', url.href);
+  }
+  async function toggle() {
+    if (bulkBusy || applying) return;
+    if (mounted || opening) { closeView(); updateUrl(); navigation.update(false); return; }
+    const skin = mw.config.get('skin');
+    if (skin !== 'vector-2022' && skin !== 'minerva') { location.assign(annotationViewUrl(location.href, revision, skin).href); return; }
+    navigation.update(true, true);
+    try { await refresh(); await openView(); updateUrl(); }
+    catch (error) { closeView(); notifyError({ hant: '無法開啟批註模式。請重新整理頁面後再試。', hans: '无法开启批注模式。请刷新页面后重试。' }, error); }
+    finally { navigation.update(Boolean(mounted)); }
+  }
+  const navigation = addMainPageReviewToolButtonsToDOM(() => { void toggle(); }); navigation.update(false);
+  let refreshing: Promise<void> | null = null;
+  async function refresh(force = false): Promise<void> {
+    if (refreshing !== null) return refreshing;
+    if (opening || bulkBusy || applying) return;
+    const editing = mounted?.view.comments?.element.contains(document.activeElement) || exportDialog?.contains(document.activeElement);
+    refreshing = (async () => {
       try {
-        const visits = browserVisits();
-        let activityError = false;
-        activity = activityTracker({ visits, pageName: title, oldid: revision, viewer: author,
-          read: async id => {
-            const stored = decodePage(await sourceApi.read(id), identity, validate);
-            const snapshot = { revision: id, generation: stored.generation, records: stored.document.toJSON() };
-            stored.document.destroy(); return snapshot;
-          },
-          show: group => {
-            if (closed) return;
-            const notice = activityNotice(group), target = group.target;
-            const url = target.commentId ? annotationCommentUrl(annotationDestination(revision).href, target.commentId) : annotationDestination(revision);
-            activityNotices.push(notifyAnnotationLink(notice.title, notice.text, url.href, async () => {
-              if (!mount || closed) return;
-              if (target.commentId && await mount.view.comments?.reveal(target.commentId)) return;
-              if (await mount.view.comments?.revealHighlight(target.highlightId)) return;
-              // Closed/deleted discussions retain their source anchor, even without a visible card.
-              const range = mount.view.restoreRange(target.anchor), first = range && textRects(range, document)[0];
-              if (first) { window.scrollBy({ top: first.top - window.innerHeight / 3, behavior: 'instant' }); mount.view.element.focus({ preventScroll: true }); }
-            }));
-          },
-          error: error => {
-            console.warn('[ReviewTool] Annotation activity baseline unavailable', error);
-            if (activityError || closed) return;
-            activityError = true;
-            void mw.notify(state.conv({ hant: '無法完整讀取或儲存上次查看的紀錄，部分更新提醒可能遺漏或重複。', hans: '无法完整读取或保存上次查看的记录，部分更新提醒可能遗漏或重复。' }), { title: 'ReviewTool', type: 'warn', autoHide: false });
-          },
-        });
-        await activity.receive(shared.published);
-        if (closed) return;
-        // Finish the toolbar layout before scrolling a comment permalink into view.
-        await subscriptionControl(mount.original, visits, title, revision, controller.signal).catch(error => {
-          failure({ hant: '無法載入批註訂閱按鈕。', hans: '无法加载批注订阅按钮。' }, error);
-        });
-        if (closed) return;
-      } catch (error) { failure({ hant: '無法使用瀏覽器的批註訂閱及查看紀錄。', hans: '无法使用浏览器的批注订阅及查看记录。' }, error); }
-      exportItem = mw.util.addPortletLink('p-cactions', '#', state.conv({ hant: '匯出所有批註', hans: '导出所有批注' }), 'ca-reviewtool-export',
-        state.conv({ hant: '匯出高亮、評論與回覆', hans: '导出高亮、评论和回复' }));
-      exportItem?.querySelector('a')?.addEventListener('click', event => {
-        event.preventDefault();
-        try { downloadAnnotationExport(document, buildAnnotationExport(identity, title, projection, shared.annotations)); }
-        catch (error) { failure({ hant: '無法匯出批註，請稍後重試。', hans: '无法导出批注，请稍后重试。' }, error); }
-      }, listener);
-
-      const refresh = () => { if (!document.hidden) void shared.sync(); };
-      polling = setInterval(refresh, 5000);
-      document.addEventListener('visibilitychange', refresh, listener); window.addEventListener('online', refresh, listener);
-      window.addEventListener('beforeunload', event => { if (shared.dirty) { event.preventDefault(); event.returnValue = ''; } }, listener);
-      if (!canWrite) notify(state.conv({ hant: '登入後即可新增批註。', hans: '登录后即可添加批注。' }), 'warn');
-      // Finish startup DOM changes before navigating to the linked passage and discussion.
-      const requestedId = new URL(location.href).searchParams.get(commentParameter), commentId = commentIdFromUrl(requestedId);
-      if (requestedId && (!commentId || !await mount.view.comments?.reveal(commentId))) notify(messages.commentUnavailable, 'warn');
-    } catch (error) { stopLoading(); if (closed) return; sync?.destroy(); mount?.destroy(); failure({ hant: '無法開啟批註模式，請稍後重試。', hans: '无法开启批注模式，请稍后重试。' }, error); }
-  })();
-  let cleanup: Promise<void> | undefined;
-  const close = (): Promise<void> => {
-    if (cleanup !== undefined) return cleanup;
-    closed = true;
-    stopLoading();
-    const draftsSaved = saveDrafts();
-    if (polling !== undefined) clearInterval(polling);
-    controller.abort(); activity?.destroy(); for (const notice of activityNotices) notice.close();
-    mount?.destroy(); exportItem?.remove(); notice?.close(); style.remove();
-    // An unfinished startup has no submitted actions to flush; abort its reads immediately.
-    if (!mount) api.abort();
-    cleanup = (async () => {
-      await ready;
-      await draftsSaved;
-      // Closing the view keeps the existing outbox if publication fails.
-      if (sync?.dirty) await sync.sync();
-      api.abort(); sync?.destroy();
+        const raw = localStorage.getItem(key);
+        if (raw === storageSnapshot && !pendingUpdate) return;
+        if (editing && !force) { pendingUpdate = true; return; }
+        const saved = storedDraft(raw, identity, author) ?? emptyStoredDraft();
+        const wasOpen = Boolean(mounted), position = { left: window.scrollX, top: window.scrollY };
+        applying = true; closeView(); restore(saved, raw);
+        if (wasOpen) { await openView(); window.scrollTo(position); }
+      } catch (error) { pendingUpdate = true; console.warn('[ReviewTool] Could not refresh browser draft.', error); }
+      finally { applying = false; updateToolbar(); }
     })();
-    return cleanup;
-  };
-  window.addEventListener('pagehide', () => { void close(); }, { once: true, ...listener });
-  return { ready, close };
+    try { await refreshing; } finally { refreshing = null; }
+  }
+  // Keep old-revision anchors on their source revision, with a direct recovery link.
+  try {
+    let latest: StoredDraft | null = null;
+    const prefix = [draftPrefix, identity.wiki, pageId].map(value => encodeURIComponent(value)).join('/') + '/';
+    for (let index = 0; index < localStorage.length; index++) {
+      const candidateKey = localStorage.key(index); if (!candidateKey?.startsWith(prefix) || !candidateKey.endsWith('/' + encodeURIComponent(author))) continue;
+      try {
+        const raw = localStorage.getItem(candidateKey); if (!raw) continue;
+        const candidate = JSON.parse(raw) as StoredDraft;
+        if (!candidate.identity || candidate.identity.revisionId === revision || !Number.isSafeInteger(candidate.identity.revisionId) || candidate.identity.revisionId < 1 || candidateKey !== reviewDraftKey(candidate.identity, author)) continue;
+        const saved = storedDraft(raw, { ...identity, revisionId: candidate.identity.revisionId }, author);
+        if (saved && (hasWork(saved) || hasWork(saved.undoClear)) && (!latest || saved.updatedAt > latest.updatedAt)) latest = saved;
+      } catch { /* Ignore records belonging to another version or format. */ }
+    }
+    if (latest && !initialHasWork) {
+      const notice = document.createElement('div'); notice.id = 'reviewtool-saved-draft'; notice.className = 'reviewtool-local-toolbar';
+      const description = document.createElement('span'); description.textContent = labels({ hant: '此條目有先前版本的批註草稿。', hans: '此条目有先前版本的批注草稿。' });
+      const link = document.createElement('a'); link.textContent = labels({ hant: '開啟已儲存的批註', hans: '打开已保存的批注' }); link.href = annotationViewUrl(location.href, latest.identity.revisionId, mw.config.get('skin')).href;
+      notice.append(description, link); document.getElementById('mw-content-text')?.before(notice);
+    }
+  } catch { /* History lookup is optional when browser storage is unavailable. */ }
+  window.addEventListener('storage', event => { if (event.key === key || event.key === null) void refresh(); });
+  window.addEventListener('focus', () => { void refresh(); });
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState !== 'hidden') void refresh(); });
+  document.addEventListener('focusout', () => { window.setTimeout(() => { void refresh(); }, 0); });
+  window.addEventListener('beforeunload', event => { if (storageFailed && version > exportedVersion) { event.preventDefault(); event.returnValue = ''; } });
+  window.addEventListener('pagehide', () => { if (storageFailed) { const content = capture(); annotations = content.annotations; drafts = content.drafts; save(); } });
+  if (new URL(location.href).searchParams.get(activationParameter) === '1' || initialHasWork) await toggle();
+  return true;
 }

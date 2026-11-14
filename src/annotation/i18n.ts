@@ -29,6 +29,7 @@ export function annotationMessages(convert: VariantConverter = text => text.hant
     send: convert({ hant: '送出', hans: '发送' }),
     cancel: convert({ hant: '取消', hans: '取消' }),
     discard: convert({ hant: '放棄草稿', hans: '放弃草稿' }),
+    clearComment: convert({ hant: '清空內容', hans: '清空内容' }),
     resolve: convert({ hant: '結束討論', hans: '结束讨论' }),
     markResolved: convert({ hant: '標記已解決', hans: '标记已解决' }),
     resolved: convert({ hant: '已解決', hans: '已解决' }),

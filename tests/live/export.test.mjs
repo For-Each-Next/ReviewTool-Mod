@@ -54,3 +54,61 @@ test('bare highlights and empty documents can be exported without inventing comm
   const result = api.buildAnnotationExport(identity, 'Page', projection, [{ id: 'bare', color: 'blue', anchor: anchor('plain', 'plain') }]);
   assert.equal(result.highlights.length, 1); assert.deepEqual(result.groups, []);
 });
+
+test('wikitext sorts quotations into permanent section links and preserves nested discussion lists', () => {
+  const source = '引言😀。\n== 第一節 ==\n[[頁面|文字]]。\n=== 子節 ===\n細節。';
+  const heading = (title, level) => ({ unit: 'utf8-byte', start: Buffer.byteLength(source.slice(0, source.indexOf('='.repeat(level) + ' ' + title))), level, id: title });
+  const annotations = [
+    { id: 'child', color: 'blue', anchor: anchor(source, '細節'), threads: [{ ...comment('child'), text: '第一點\n* 第二點\n** 深一層', replies: [{ ...comment('reply'), text: '回覆' }] }] },
+    { id: 'first', color: 'yellow', anchor: anchor(source, '[[頁面|文字]]'), threads: [{ ...comment('first'), text: '保留[[連結]]與{{模板|參數}}。' }] },
+    { id: 'intro', color: 'green', anchor: anchor(source, '引言😀'), threads: [] },
+  ];
+  const original = structuredClone(annotations);
+  const result = api.buildReviewWikitext(identity, '測試頁面', api.createProjection(source), annotations, [heading('第一節', 2), heading('子節', 3)]);
+  assert.equal(result, [
+    '=== For Each ... Next的意见 @ 測試頁面 ===', '',
+    '以下内容使用[[WP:REVTOOL]]生成<!-- 预期条目变化比较大，没有启用[[Special:PrefixIndex/Wikipedia:ReviewTool/data/|联机行内凸显]]功能😂 -->。--~~~~', '',
+    "'''[[Special:PermaLink/94447348|序言]]'''",
+    '# {{rvw|引言😀}} —— ', '--~~~~', '',
+    "'''[[Special:PermaLink/94447348#第一節|第一節]]'''",
+    '# {{rvw|文字}} —— 保留[[連結]]與{{模板|參數}}。', '--~~~~', '',
+    "'''[[Special:PermaLink/94447348#子節|第一節 / 子節]]'''",
+    '# {{rvw|細節}} —— ', '#* 第一點', '#* 第二點', '#** 深一層', '#** 回覆', '--~~~~',
+  ].join('\n'));
+  assert.deepEqual(annotations, original, 'formatting must not reorder or change stored annotations');
+});
+
+test('wikitext escapes article text and page labels without escaping authored comment markup', () => {
+  const source = '<nowiki>A|{{danger}} & <b> _ ~ : # * ; = " \' [link]</nowiki>';
+  const projection = api.createProjection(source);
+  const result = api.buildReviewWikitext(identity, 'Page|{{bad}}', projection, [
+    { id: 'literal', color: 'red', anchor: anchor(source, source.slice('<nowiki>'.length, -'</nowiki>'.length)), threads: [{ ...comment('c'), text: '意見：{{done}} [[連結]]' }] },
+  ]);
+  assert.match(result, /^=== For Each \.\.\. Next的意见 @ Page&#124;&#123;&#123;bad&#125;&#125; ===/);
+  assert.ok(result.includes('# {{rvw|A&#124;&#123;&#123;danger&#125;&#125; &#38; &#60;b&#62; &#95; &#126; &#58; &#35; &#42; &#59; &#61; &#34; &#39; &#91;link&#93;}} —— 意見：{{done}} [[連結]]'));
+  assert.ok(!result.includes('{{rvw|A|{{danger}}'));
+});
+
+test('wikitext keeps multiline template, table, comments and literal-tag constructs intact', () => {
+  const source = '正文';
+  const note = ['{{模板', '|參數=值', '}}', '<!-- 隱藏', '第二行 -->', '<nowiki>原樣', '* 不加入列表</nowiki>', '{| class="wikitable"', '|-', '| 儲存格', '|}', '最後一行'].join('\n');
+  const result = api.buildReviewWikitext(identity, 'Page', api.createProjection(source), [
+    { id: 'h', color: 'yellow', anchor: anchor(source, source), threads: [{ ...comment('c'), text: note }] },
+  ]);
+  assert.ok(result.includes('#* {{模板\n|參數=值\n}}\n#* <!-- 隱藏\n第二行 -->\n#* <nowiki>原樣\n* 不加入列表</nowiki>\n#* {| class="wikitable"\n|-\n| 儲存格\n|}\n#* 最後一行'));
+  for (const text of ['{{模板\n|參數=值', '<!-- 文字\n更多', '<syntaxhighlight lang="js">\nconst x = 1;', '{|\n|-']) assert.equal(api.reviewCommentInMarkup(text), true);
+  for (const text of ['{{模板\n|參數=值\n}}', '<!-- 文字 -->', '<ref name="x" />\n', '<nowiki>原樣</nowiki>', '{|\n|}\n普通文字']) assert.equal(api.reviewCommentInMarkup(text), false);
+});
+
+test('wikitext handles empty or removed annotations and stable ordering at one anchor', () => {
+  const source = '正文', projection = api.createProjection(source);
+  const highlight = { id: 'h', color: 'yellow', anchor: anchor(source, source) };
+  assert.equal(api.buildReviewWikitext(identity, 'Page', projection, []), '');
+  assert.equal(api.buildReviewWikitext(identity, 'Page', projection, [{ ...highlight, deleted: { by: 'Example', at: time } }]), '');
+  const result = api.buildReviewWikitext(identity, 'Page', projection, [
+    { ...highlight, id: 'z', threads: [{ ...comment('z'), text: '後一項' }] },
+    { ...highlight, id: 'a', threads: [{ ...comment('a'), text: '前一項' }] },
+  ]);
+  assert.ok(result.indexOf('前一項') < result.indexOf('後一項'));
+  assert.throws(() => api.buildReviewWikitext({ ...identity, revisionId: 0 }, 'Page', projection, []), /valid article revision/);
+});

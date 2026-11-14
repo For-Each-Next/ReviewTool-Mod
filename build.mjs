@@ -12,8 +12,11 @@ const pkgJson = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta
 const watch = process.argv.includes('--watch');
 const release = process.argv.includes('--release');
 const extension = process.argv.includes('--extension');
+const userscript = process.argv.includes('--userscript');
+const minify = release && !userscript;
 const dryRun = process.argv.includes('--dry-run');
 if (release && dryRun) throw new Error('A dry-run bundle cannot be built as a release.');
+if (userscript && (extension || dryRun)) throw new Error('Build userscripts separately from development extensions and dry-run bundles.');
 const extensionDir = path.join(__dirname, '.cache', 'reviewtool-extension', dryRun ? 'dry-run' : 'normal');
 if (extension) {
 	fs.mkdirSync(extensionDir, { recursive: true });
@@ -118,7 +121,7 @@ const cssMinifyPlugin = {
 	setup(build) {
 		build.onLoad({ filter: /\.css$/ }, async (args) => {
 			const text = await fs.promises.readFile(args.path, 'utf8');
-			if (!release) {
+			if (!minify) {
 				return { contents: text, loader: 'text' };
 			}
 			const result = await esbuild.transform(text, {
@@ -132,12 +135,12 @@ const cssMinifyPlugin = {
 
 const buildOptions = {
 	entryPoints: [path.join(__dirname, 'src', extension ? 'dev-entry.ts' : 'main.ts')],
-	outfile: extension ? path.join(extensionDir, 'bundle.js') : path.join(__dirname, 'dist', dryRun ? 'bundled.dry-run.js' : 'bundled.js'),
+	outfile: extension ? path.join(extensionDir, 'bundle.js') : path.join(__dirname, 'dist', userscript ? 'reviewtool-mod.user.js' : dryRun ? 'bundled.dry-run.js' : 'bundled.js'),
 	bundle: true,
 	format: 'iife',
 	charset: 'utf8',
 	target: ['es2017'],
-	minify: release,
+	minify,
 	sourcemap: release ? false : 'inline',
 	sourcesContent: true,
 	plugins: [mediawikiReplacement, vueSfcPlugin, cssMinifyPlugin],
@@ -146,13 +149,28 @@ const buildOptions = {
 		'.vue': 'ts'
 	},
 	banner: {
-		js: `// [[User:SuperGrey/gadgets/ReviewTool]]
-// Repository: https://github.com/QZGao/ReviewTool
+		js: `${userscript ? `// ==UserScript==
+// @name         ReviewTool Mod
+// @namespace    https://github.com/For-Each-Next/ReviewTool-Mod
+// @version      ${pkgJson.version}
+// @description  Local article annotations with direct wikitext export.
+// @match        https://zh.wikipedia.org/*
+// @match        https://zh.m.wikipedia.org/*
+// @run-at       document-end
+// @grant        none
+// @sandbox      raw
+// @noframes
+// ==/UserScript==
+
+` : ''}// [[User:SuperGrey/gadgets/ReviewTool]]
+// Based on https://github.com/QZGao/ReviewTool
+// Repository: https://github.com/For-Each-Next/ReviewTool-Mod
 // Release: ${pkgJson.version}
 // Timestamp: ${new Date().toISOString()}
-// <nowiki>`
+// <nowiki>
+(window.RLQ = window.RLQ || []).push([["mediawiki.base"], () => {`
 	},
-	footer: { js: '// </nowiki>' },
+	footer: { js: '}]);\n// </nowiki>' },
 	logLevel: 'info',
 };
 

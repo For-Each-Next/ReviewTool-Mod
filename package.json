@@ -1,13 +1,14 @@
 {
-	"name": "reviewtool",
+	"name": "reviewtool-mod",
 	"version": "2.2.0",
 	"private": true,
-	"description": "Review articles and provide feedback on Chinese Wikipedia.",
+	"description": "Local Chinese Wikipedia article annotations with wikitext export.",
 	"type": "module",
 	"scripts": {
 		"build": "node build.mjs",
 		"watch": "node build.mjs --watch",
 		"release": "node build.mjs --release",
+		"build:userscript": "node build.mjs --userscript --release",
 		"lint": "eslint \"src/**/*.{ts,tsx,vue}\" --no-inline-config",
 		"test:annotation": "node tests/annotation/build.mjs && node --test tests/annotation/*.test.mjs",
 		"check:annotation": "tsc --noEmit --strict --exactOptionalPropertyTypes --skipLibCheck --target ES2017 --module ESNext --moduleResolution node --lib ES2017,DOM src/annotation/index.ts && eslint \"src/annotation/**/*.ts\" --no-inline-config",
@@ -20,7 +21,8 @@
 		"dev:chrome": "node tests/live/launch.mjs",
 		"dev:chrome:dry": "node tests/live/launch.mjs --dry-run",
 		"check:live": "tsc --noEmit --strict --skipLibCheck --target ES2020 --module ESNext --moduleResolution node --lib ES2020,DOM --types types-mediawiki,node global.d.ts src/mediawiki.ts src/mediawiki-dry-run.ts src/annotation/live.ts && eslint \"src/mediawiki*.ts\" \"src/annotation/live*.ts\" src/dev-entry.ts src/main.ts src/state.ts --no-inline-config",
-		"test:live": "node --test tests/live/*.test.mjs"
+		"test:live": "node --test tests/live/*.test.mjs",
+		"test:mod": "node tests/annotation/build.mjs && node --test tests/annotation/model.test.mjs tests/annotation/browser.test.mjs tests/live/annotation-entry.test.mjs tests/live/export.test.mjs && node --test --test-name-pattern=local tests/annotation/comments.test.mjs tests/annotation/highlights.test.mjs"
 	},
 	"devDependencies": {
 		"@types/node": "^24.10.1",

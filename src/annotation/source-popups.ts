@@ -2,8 +2,44 @@ import { annotationMessages, type AnnotationMessages } from './i18n';
 import type { ElementNode } from './types';
 import { imagePreviews } from './image-preview';
 import type { PopupLayout } from './popup-layout';
+import { decodeHTMLStrict } from 'entities';
+import { formatReferenceSource } from './reference-template';
+import { externalLinkAt } from './external-links';
 
 let nextPopup = 0;
+
+/** Keep source readable and selectable while making citation destinations directly usable. */
+function appendReferenceSource(doc: Document, code: HTMLElement, source: string): void {
+  const base = new URL('/wiki/', /^https?:/.test(doc.location?.href ?? '') ? doc.location.href : 'https://zh.wikipedia.org/');
+  const pattern = /\[\[[^\r\n\[\]]+\]\]|(?:https?:)?\/\/[^\s<>\[\]{}|]+/gi;
+  let from = 0, match: RegExpExecArray | null;
+  while ((match = pattern.exec(source))) {
+    const raw = match[0];
+    let href: URL | undefined, length = raw.length;
+    if (raw.startsWith('[[')) {
+      const title = decodeHTMLStrict(raw.slice(2, -2).split('|')[0]).trim().replace(/^:/, '');
+      const [page, ...fragment] = title.split('#');
+      if (page && !/^[.]{1,2}$/.test(page) && !/[\u0000-\u001f\u007f<>\[\]{}]/.test(page)) {
+        href = new URL(encodeURIComponent(page.replace(/ /g, '_')), base);
+        if (fragment.length) href.hash = fragment.join('#').replace(/ /g, '_');
+      }
+    } else {
+      const external = externalLinkAt(source, match.index, base.href);
+      if (external) {
+        const target = new URL(external.href);
+        if (target.protocol === 'https:' || target.protocol === 'http:') { href = target; length = external.end - match.index; }
+      }
+    }
+    if (!href) continue;
+    code.append(doc.createTextNode(source.slice(from, match.index)));
+    const link = doc.createElement('a');
+    link.textContent = raw.slice(0, length); link.href = href.href;
+    link.target = '_blank'; link.rel = 'noopener noreferrer';
+    code.append(link);
+    from = match.index + length;
+  }
+  code.append(doc.createTextNode(source.slice(from)));
+}
 
 /** One interactive source popup per mounted view; its contents are excluded from annotation mapping. */
 export function sourcePopups(doc: Document, root: HTMLElement, source: string, entries: WeakMap<HTMLElement, ElementNode>, images: WeakMap<HTMLElement, HTMLImageElement>, selectTrigger: (element: HTMLElement) => void, layout: PopupLayout, messages: AnnotationMessages = annotationMessages()) {
@@ -78,7 +114,12 @@ export function sourcePopups(doc: Document, root: HTMLElement, source: string, e
     const isImage = model.inspection.kind === 'image';
     heading.textContent = isImage ? messages.imagePreview : model.inspection.kind === 'link' ? messages.linkSource : messages.referenceSource;
     code.hidden = isImage;
-    code.textContent = isImage ? '' : source.slice(model.inspection.from, model.inspection.to);
+    code.replaceChildren();
+    if (!isImage) {
+      const raw = source.slice(model.inspection.from, model.inspection.to);
+      if (model.inspection.kind === 'reference') appendReferenceSource(doc, code, formatReferenceSource(raw));
+      else code.textContent = raw;
+    }
     preview.hidden = !isImage;
     preview.textContent = isImage ? messages.imageLoading : '';
     if (!popup.isConnected) root.append(popup);

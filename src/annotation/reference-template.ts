@@ -1,5 +1,6 @@
 import { decodeHTMLStrict } from 'entities';
 import { templateFields } from './template-fields';
+import { opaqueAt, readTag } from './opaque';
 
 const rArgs = new Set(['name', 'n', 'group', 'grp', 'g', 'page', 'p', 'pages', 'pp']);
 for (let i = 1; i <= 9; i++) {
@@ -76,4 +77,34 @@ function shortFootnote(value: Value): string | null {
   const where = [value('p', 'page') || value('pp', 'pages'), value('loc')].filter(Boolean).join(', ');
   // Readable source identity, without generating Wikipedia's page-wide numbering or bibliography links.
   return `[${parts.join(' ')}${where ? ':' + where : ''}]`;
+}
+
+/** A display-only citation layout; the projection and its source coordinates stay unchanged. */
+export function formatReferenceSource(source: string): string {
+  let result = '', cursor = 0, formatted = false;
+  while (cursor < source.length) {
+    const extent = opaqueAt(source, cursor);
+    if (!extent) { result += source[cursor++]; continue; }
+    const raw = source.slice(cursor, extent.end);
+    const fields = extent.reason === 'template' && !raw.startsWith('{{{')
+      ? templateFields(source, cursor + 2, extent.end - 2) : null;
+    const title = fields?.length ? source.slice(fields[0].from, fields[0].to).trim().replace(/_/g, ' ').replace(/^(?:template|模板):\s*/i, '') : '';
+    if (fields && /^cite(?:\s+[a-z][a-z -]*)?$/i.test(title)) {
+      const name = title.replace(/\s+/g, ' ').toLowerCase().replace(/^cite/, 'Cite');
+      const parameters = fields.slice(1).map(field => {
+        if (field.equals === undefined) return `  | ${source.slice(field.from, field.to).trim()}`;
+        return `  | ${source.slice(field.from, field.equals).trim()} = ${source.slice(field.equals + 1, field.to).trim()}`;
+      });
+      result += [`{{${name}`, ...parameters, '}}'].join('\n');
+      formatted = true;
+    } else result += raw;
+    cursor = extent.end;
+  }
+  if (!formatted) return source;
+  const opening = readTag(result, 0);
+  const closing = /<\/ref\s*>\s*$/i.exec(result);
+  if (opening?.name === 'ref' && !opening.closing && !opening.selfClosing && closing) {
+    return `${result.slice(0, opening.end)}\n${result.slice(opening.end, closing.index).trim()}\n${closing[0].trim()}`;
+  }
+  return result;
 }

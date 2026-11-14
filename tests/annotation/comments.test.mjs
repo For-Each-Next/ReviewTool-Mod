@@ -1242,3 +1242,66 @@ test('a host rejecting a submission keeps the private draft until a successful r
     assert.deepEqual(await page.evaluate(() => draftSnapshots.at(-1)), []);
   });
 });
+
+test('local review uses floating autosaved editors and clearing deletes the mark and every associated draft', async () => {
+  await inPage(async page => {
+    await page.evaluate(() => {
+      const projection = commentView.projection;
+      commentMount.destroy(); window.localDraftSnapshots = [];
+      const column = document.querySelector('.vector-column-end');
+      column.innerHTML = '<div class="vector-sticky-pinned-container"><button id="original-page-tools">Page tools</button></div>';
+      window.commentMount = annotationLab.annotation.mountWikipediaAnnotation(document, projection, {
+        comments: true, commentAuthor: 'Example', commentAutosave: true, commentFloating: true, commentLinks: false,
+        highlighting: {}, onCommentDraftsChange: drafts => localDraftSnapshots.push(drafts),
+      });
+      window.commentView = commentMount.view;
+      commentView.highlighting.dispatch({ type: 'add-highlight', highlight: {
+        id: 'local-mark', color: 'yellow', anchor: { unit: 'utf8-byte', start: 0, end: 13 },
+        author: 'Example', createdAt: '2026-01-01T00:00:00.000Z',
+      } });
+    });
+    const panel = page.locator('.annotation-comments'), input = panel.getByRole('textbox');
+    await input.waitFor({ state: 'visible' });
+    assert.equal(await panel.getAttribute('data-layout'), 'floating');
+    assert.equal(await page.locator('.vector-column-end .annotation-comments').count(), 0);
+    assert.equal(await page.locator('.vector-column-end #original-page-tools').count(), 1);
+    assert.equal(await panel.getByRole('button', { name: /^(送出|儲存修改|隱藏|複製評論連結)$/ }).count(), 0);
+    await input.fill('Immediate private note');
+    assert.deepEqual(await page.evaluate(() => localDraftSnapshots.at(-1)), [{ annotationId: 'local-mark', kind: 'new', text: 'Immediate private note' }]);
+    assert.equal(await page.evaluate(() => commentView.highlighting.annotations[0].threads?.length ?? 0), 0);
+    await panel.getByRole('button', { name: '清空內容', exact: true }).click();
+    assert.equal(await panel.locator('.annotation-comment-thread').count(), 0);
+    assert.equal(await page.evaluate(() => Boolean(commentView.highlighting.annotations[0].deleted)), true);
+    assert.deepEqual(await page.evaluate(() => commentView.comments.drafts), []);
+    assert.deepEqual(await page.evaluate(() => localDraftSnapshots.at(-1)), []);
+    await page.evaluate(() => commentMount.destroy());
+    assert.equal(await page.locator('.annotation-mobile-comments-host').count(), 0);
+    assert.equal(await page.locator('.vector-column-end #original-page-tools').count(), 1);
+  });
+});
+
+test('local editor restores typed drafts and continues lists without changing multiline markup', async () => {
+  await inPage(async page => {
+    await page.evaluate(() => {
+      const projection = commentView.projection;
+      commentMount.destroy();
+      window.commentMount = annotationLab.annotation.mountWikipediaAnnotation(document, projection, {
+        comments: true, commentAuthor: 'Example', commentAutosave: true, commentFloating: true, commentLinks: false,
+        highlighting: { initial: [{ id: 'restored-local', color: 'blue', anchor: { unit: 'utf8-byte', start: 0, end: 13 }, author: 'Example', createdAt: '2026-01-01T00:00:00.000Z' }] },
+        commentDrafts: [{ annotationId: 'restored-local', kind: 'new', text: 'Restored note' }],
+      });
+      window.commentView = commentMount.view;
+    });
+    await page.evaluate(() => commentView.comments.revealHighlight('restored-local'));
+    const input = page.locator('.annotation-comments textarea');
+    assert.equal(await input.inputValue(), 'Restored note');
+    await input.focus(); await input.press('End'); await input.press('Enter');
+    assert.equal(await input.inputValue(), '* Restored note\n* ');
+    await input.press('Enter');
+    assert.equal(await input.inputValue(), '* Restored note\n');
+    await input.fill('{{example\n|value=first'); await input.press('End'); await input.press('Enter');
+    assert.equal(await input.inputValue(), '{{example\n|value=first\n');
+    await input.fill('[[Page|label]]'); await input.press('End'); await input.press('Shift+Enter');
+    assert.equal(await input.inputValue(), '[[Page|label]]\n');
+  });
+});

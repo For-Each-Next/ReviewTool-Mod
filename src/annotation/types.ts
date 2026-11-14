@@ -126,6 +126,8 @@ export type HighlightAction =
 
 export interface HighlightOptions {
   initial?: readonly HighlightAnnotation[];
+  /** Create comments with one action and automatically alternate highlight colors. */
+  localEditing?: boolean;
   onChange?: (annotations: readonly HighlightAnnotation[], action: HighlightAction) => void;
 }
 
@@ -168,6 +170,12 @@ export interface RenderOptions {
   /** Current user's local MediaWiki group names. Moderator edits/removals require a reason. */
   commentUserGroups?: readonly string[];
   commentCanWrite?: boolean;
+  /** Keep local comments as editable drafts; the host includes them directly in wikitext exports. */
+  commentAutosave?: boolean;
+  /** Use anchored floating editors at every viewport width, without taking over a sidebar. */
+  commentFloating?: boolean;
+  /** Local-only reviews have no public comment permalink to copy. */
+  commentLinks?: boolean;
   commentLink?: (id: string) => string;
   /** Clipboard feedback; the Wikipedia host displays a notification. */
   onCommentLinkCopy?: (copied: boolean) => void;
