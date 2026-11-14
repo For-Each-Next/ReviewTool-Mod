@@ -2,6 +2,8 @@ name: Build Tampermonkey script
 
 on:
   push:
+    branches: ['**']
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -30,3 +32,26 @@ jobs:
           name: reviewtool-mod-userscript
           path: dist/reviewtool-mod.user.js
           if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Download userscript
+        run: gh run download "$GITHUB_RUN_ID" --name reviewtool-mod-userscript --dir dist
+      - name: Publish release
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/reviewtool-mod.user.js --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/reviewtool-mod.user.js \
+              --verify-tag --title "ReviewTool Mod $RELEASE_TAG" --generate-notes
+          fi
